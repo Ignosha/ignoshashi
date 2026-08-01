@@ -1,0 +1,102 @@
+/* ══════════════════════════════════════════
+   THEME CSS VARIABLES
+   Syncs with ThemeContext via data-theme attr
+   ══════════════════════════════════════════ */
+
+:root,
+[data-theme="matrix"] {
+  --color-bg: #050505;
+  --color-bg-secondary: #0a0f0a;
+  --color-primary: #00ff41;
+  --color-text: #e0ffe0;
+  --color-text-muted: #80b080;
+  --color-border: rgba(0, 255, 65, 0.2);
+  --color-card-bg: rgba(0, 20, 0, 0.8);
+  --color-danger: #ff3333;
+  --color-success: #00ff41;
+  --color-warning: #ffaa00;
+  --color-primary-rgb: 0, 255, 65;
+}
+
+[data-theme="cyberpunk"] {
+  --color-bg: #0a0010;
+  --color-bg-secondary: #100020;
+  --color-primary: #ff00ff;
+  --color-text: #f0e0ff;
+  --color-text-muted: #a080c0;
+  --color-border: rgba(255, 0, 255, 0.2);
+  --color-card-bg: rgba(20, 0, 40, 0.8);
+  --color-danger: #ff0044;
+  --color-success: #00ff88;
+  --color-warning: #ffaa00;
+  --color-primary-rgb: 255, 0, 255;
+}
+
+[data-theme="ocean"] {
+  --color-bg: #000a14;
+  --color-bg-secondary: #001020;
+  --color-primary: #00aaff;
+  --color-text: #d0e8ff;
+  --color-text-muted: #6090b0;
+  --color-border: rgba(0, 170, 255, 0.2);
+  --color-card-bg: rgba(0, 10, 30, 0.8);
+  --color-danger: #ff4444;
+  --color-success: #00cc66;
+  --color-warning: #ffaa00;
+  --color-primary-rgb: 0, 170, 255;
+}
+
+[data-theme="sunset"] {
+  --color-bg: #0a0505;
+  --color-bg-secondary: #150a05;
+  --color-primary: #ff6600;
+  --color-text: #ffe8d0;
+  --color-text-muted: #b08060;
+  --color-border: rgba(255, 102, 0, 0.2);
+  --color-card-bg: rgba(20, 8, 0, 0.8);
+  --color-danger: #ff2222;
+  --color-success: #44cc44;
+  --color-warning: #ffcc00;
+  --color-primary-rgb: 255, 102, 0;
+}
+
+[data-theme="mono"] {
+  --color-bg: #0a0a0a;
+  --color-bg-secondary: #151515;
+  --color-primary: #ffffff;
+  --color-text: #d0d0d0;
+  --color-text-muted: #808080;
+  --color-border: rgba(255, 255, 255, 0.15);
+  --color-card-bg: rgba(20, 20, 20, 0.8);
+  --color-danger: #ff4444;
+  --color-success: #66ff66;
+  --color-warning: #ffcc00;
+  --color-primary-rgb: 255, 255, 255;
+}
+
+[data-theme="retroAmber"] {
+  --color-bg: #080804;
+  --color-bg-secondary: #101008;
+  --color-primary: #ffb000;
+  --color-text: #ffe8b0;
+  --color-text-muted: #b09050;
+  --color-border: rgba(255, 176, 0, 0.2);
+  --color-card-bg: rgba(20, 16, 0, 0.8);
+  --color-danger: #ff3333;
+  --color-success: #88cc00;
+  --color-warning: #ff8800;
+  --color-primary-rgb: 255, 176, 0;
+}
+
+/* ══════════════════════════════════════════
+   LIGHT MODE OVERRIDES
+   ══════════════════════════════════════════ */
+
+[data-mode="light"] {
+  --color-bg: #f0f5f0;
+  --color-bg-secondary: #e0e8e0;
+  --color-text: #1a2a1a;
+  --color-text-muted: #507050;
+  --color-card-bg: rgba(255, 255, 255, 0.9);
+  --color-border: rgba(0, 100, 0, 0.15);
+}
