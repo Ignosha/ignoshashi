@@ -86,21 +86,28 @@ async function main() {
   assert.equal(platform, await platformSigner.getAddress(), "BNB_TEST_PLATFORM_ADDRESS must match the supplied local platform key");
   const outsider = Wallet.createRandom().connect(provider);
 
-  const deploymentNonce = await provider.getTransactionCount(creator, "pending");
+  let deploymentNonce;
+  let deploymentReceipt;
   const factory = await stage("factory deployment", async () => {
-    const deployed = await new ContractFactory(factoryArtifact.abi, factoryArtifact.bytecode, creatorSigner).deploy(platform, 100, 5000, { nonce: deploymentNonce });
+    const deployed = await new ContractFactory(factoryArtifact.abi, factoryArtifact.bytecode, creatorSigner).deploy(platform, 100, 5000);
     const deploymentTx = deployed.deploymentTransaction();
     assert.ok(deploymentTx, "factory deployment transaction missing");
-    await withTimeout(deploymentTx.wait(), "factory deployment receipt timed out");
+    deploymentNonce = deploymentTx.nonce;
+    deploymentReceipt = await withTimeout(deploymentTx.wait(), "factory deployment receipt timed out");
+    assert.equal(deploymentReceipt?.status, 1, "factory deployment receipt status was not successful");
     return deployed;
   });
   const factoryAddress = await factory.getAddress();
   const actualDeployer = await creatorSigner.getAddress();
   assert.equal(actualDeployer, deployer, "factory signer identity changed unexpectedly");
-  const createNonce = await provider.getTransactionCount(actualDeployer, "pending");
-  console.error(`[bnb-anvil] deployer ${actualDeployer} pending nonce ${createNonce}`);
+  const latestNonce = await provider.getTransactionCount(actualDeployer, "latest");
+  const pendingNonce = await provider.getTransactionCount(actualDeployer, "pending");
+  console.error(`[bnb-anvil] deployer ${actualDeployer}; deployment tx nonce ${deploymentNonce}; latest nonce ${latestNonce}; pending nonce ${pendingNonce}`);
+  assert.ok(Number.isSafeInteger(deploymentNonce), `deployment nonce is invalid: ${deploymentNonce}`);
+  assert.ok(latestNonce > deploymentNonce, `nonce inconsistent after factory deployment: latest ${latestNonce}, deployment tx ${deploymentNonce}`);
+  assert.ok(pendingNonce >= latestNonce, `nonce inconsistent after factory deployment: pending ${pendingNonce}, latest ${latestNonce}`);
   const createFactory = factory.connect(creatorSigner);
-  const createReceipt = await stage("token creation", () => sendAndWait("createToken", createFactory.createToken("Anvil Meme", "ANV", 10_000, 1_000_000_000n, 1_000_000_000n, { nonce: createNonce }), provider));
+  const createReceipt = await stage("token creation", () => sendAndWait("createToken", createFactory.createToken("Anvil Meme", "ANV", 10_000, 1_000_000_000n, 1_000_000_000n), provider));
   const created = createReceipt.logs.map(log => { try { return factory.interface.parseLog(log); } catch { return null; } }).find(event => event?.name === "TokenCreated");
   assert.ok(created, "TokenCreated event missing");
   const tokenAddress = getAddress(created.args.token);
