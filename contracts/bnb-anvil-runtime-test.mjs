@@ -62,6 +62,15 @@ async function expectRevert(action, expected, label = `expected ${expected}`) {
   catch (error) { const text = String(error?.shortMessage || error?.reason || error?.message || error); assert.ok(text.includes(expected), `expected ${expected}, got ${text}`); console.error(`[bnb-anvil] ${label}: observed ${expected}`); return; }
   assert.fail(`expected transaction to revert with ${expected}`);
 }
+async function freshNonceManager(rpc, key, targetNonce, label) {
+  const freshProvider = new JsonRpcProvider(rpc, undefined, { staticNetwork: false });
+  const wallet = new Wallet(key, freshProvider);
+  const signer = new NonceManager(wallet);
+  const pendingNonce = await withTimeout(freshProvider.getTransactionCount(await wallet.getAddress(), "pending"), `${label} pending nonce lookup timed out`);
+  assert.ok(pendingNonce <= targetNonce, `${label} pending nonce ${pendingNonce} exceeds receipt-derived nonce ${targetNonce}`);
+  for (let nonce = pendingNonce; nonce < targetNonce; nonce += 1) signer.increment();
+  return { provider: freshProvider, signer };
+}
 
 async function main() {
   const factoryArtifact = loadArtifact(artifactPath, "BNB factory");
@@ -143,17 +152,38 @@ async function main() {
   const amount = 100n;
   const [cost, fee] = await stage("buy quote", () => token.getBuyCost(amount));
   const total = cost + fee;
-  await stage("buy", () => sendAndWait("buy", token.buy(amount, total, BigInt(Math.floor(Date.now() / 1000) + 300), { value: total }), provider));
+  const buyTx = await stage("buy submission", () => withTimeout(token.buy(amount, total, BigInt(Math.floor(Date.now() / 1000) + 300), { value: total }), "buy submission timed out"));
+  const buyReceipt = await stage("buy", () => sendAndWait("buy", Promise.resolve(buyTx), provider));
+  const minedBuyTx = await withTimeout(provider.getTransaction(buyTx.hash), "buy transaction lookup timed out");
+  assert.ok(minedBuyTx, `buy transaction ${buyTx.hash} not found after receipt confirmation`);
+  assert.equal(buyReceipt?.status, 1, "buy receipt status was not successful");
+  assert.equal(getAddress(minedBuyTx.from), creator, "buy transaction sender mismatch");
+  const minedBuyNonce = minedBuyTx.nonce;
+  assert.ok(Number.isSafeInteger(minedBuyNonce), `mined buy nonce is invalid: ${minedBuyNonce}`);
+  console.error(`[bnb-anvil] buy mined nonce ${minedBuyNonce}; receipt status ${buyReceipt.status}`);
   await stage("buy assertions", async () => { assert.equal(await token.balanceOf(creator), amount); assert.equal(await token.trackedGraduationReserve(), cost); assert.equal(await token.feeCredits(platform), fee / 2n); assert.equal(await token.feeCredits(creator), fee - fee / 2n); });
   await stage("buy revert assertions", async () => { await expectRevert(() => token.buy(1, total, 0, { value: total }), "DEADLINE", "buy deadline revert"); await expectRevert(() => token.buy(1, 0, BigInt(Math.floor(Date.now() / 1000) + 300), { value: total }), "SLIPPAGE", "buy slippage revert"); });
   const sellAmount = 40n;
   const [proceeds, sellFee] = await stage("sell quote", () => token.getSellProceeds(sellAmount));
   const net = proceeds - sellFee;
-  await stage("approval", () => sendAndWait("approve", token.approve(tokenAddress, sellAmount), provider));
-  await stage("sell", () => sendAndWait("sell", token.sell(sellAmount, net, BigInt(Math.floor(Date.now() / 1000) + 300)), provider));
-  await stage("sell assertions", async () => { assert.equal(await token.balanceOf(creator), amount - sellAmount); assert.equal(await token.trackedGraduationReserve(), cost - net); assert.equal(await token.feeCredits(platform), fee / 2n + sellFee / 2n); assert.equal(await token.feeCredits(creator), fee - fee / 2n + sellFee - sellFee / 2n); });
-  await stage("sell revert assertions", async () => { await expectRevert(() => token.sell(1, net + 1n, BigInt(Math.floor(Date.now() / 1000) + 300)), "SLIPPAGE", "sell slippage revert"); await expectRevert(() => token.sell(1, 0, 0), "DEADLINE", "sell deadline revert"); });
-  await stage("fee withdrawal assertions", async () => { const outsiderToken = token.connect(outsider); await expectRevert(() => outsiderToken.withdrawFees(), "NO_FEES", "outsider fee withdrawal revert"); await sendAndWait("platform fee withdrawal", token.connect(platformSigner).withdrawFees(), provider); assert.equal(await token.feeCredits(platform), 0n); await sendAndWait("creator fee withdrawal", token.withdrawFees(), provider); assert.equal(await token.feeCredits(creator), 0n); });
+  // Rebuild the buyer/holder signer from a fresh provider after the mined buy. The
+  // original Contract signer may retain stale nonce state across Anvil receipt caches.
+  const approvalNonce = minedBuyNonce + 1;
+  const { provider: holderProvider, signer: holderSigner } = await freshNonceManager(rpcUrl, creatorKey, approvalNonce, "approval holder");
+  const holderAddress = await holderSigner.getAddress();
+  assert.equal(holderAddress, creator, "approval holder signer mismatch");
+  const holderToken = new Contract(tokenAddress, tokenArtifact.abi, holderSigner);
+  const approvalTx = await withTimeout(holderToken.approve(tokenAddress, sellAmount), "approve submission timed out");
+  assert.ok(approvalTx?.hash, "approve did not return a transaction hash");
+  assert.equal(approvalTx.from, creator, "approve transaction sender mismatch");
+  assert.equal(approvalTx.nonce, approvalNonce, "approve transaction nonce differs from receipt-derived next nonce");
+  console.error(`[bnb-anvil] approval sender ${approvalTx.from}; nonce ${approvalTx.nonce}; hash ${approvalTx.hash}`);
+  await stage("approval", () => sendAndWait("approve", Promise.resolve(approvalTx), holderProvider));
+  const sellToken = new Contract(tokenAddress, tokenArtifact.abi, holderSigner);
+  await stage("sell", () => sendAndWait("sell", sellToken.sell(sellAmount, net, BigInt(Math.floor(Date.now() / 1000) + 300)), holderProvider));
+  await stage("sell assertions", async () => { assert.equal(await sellToken.balanceOf(creator), amount - sellAmount); assert.equal(await sellToken.trackedGraduationReserve(), cost - net); assert.equal(await sellToken.feeCredits(platform), fee / 2n + sellFee / 2n); assert.equal(await sellToken.feeCredits(creator), fee - fee / 2n + sellFee - sellFee / 2n); });
+  await stage("sell revert assertions", async () => { await expectRevert(() => sellToken.sell(1, net + 1n, BigInt(Math.floor(Date.now() / 1000) + 300)), "SLIPPAGE", "sell slippage revert"); await expectRevert(() => sellToken.sell(1, 0, 0), "DEADLINE", "sell deadline revert"); });
+  await stage("fee withdrawal assertions", async () => { const outsiderToken = token.connect(outsider); await expectRevert(() => outsiderToken.withdrawFees(), "NO_FEES", "outsider fee withdrawal revert"); await sendAndWait("platform fee withdrawal", token.connect(platformSigner).withdrawFees(), provider); assert.equal(await sellToken.feeCredits(platform), 0n); await sendAndWait("creator fee withdrawal", sellToken.withdrawFees(), holderProvider); assert.equal(await sellToken.feeCredits(creator), 0n); });
   await stage("graduation gate assertions", async () => { await expectRevert(() => token.requestGraduation(outsider.address), "BNB_GRADUATION_GATED", "outsider graduation request"); await expectRevert(() => token.executeGraduation(), "BNB_GRADUATION_GATED", "graduation execution"); });
   console.log(`PASS BNB Anvil runtime: chain ${chainId}, factory ${factoryAddress}, token ${tokenAddress}`);
   console.log("PASS create, custody, buy/sell, fee credits/withdrawal, deadline/slippage, and graduation gates");
