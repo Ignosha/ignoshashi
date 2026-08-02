@@ -19,8 +19,8 @@ export const PLATFORM_FEE_RECIPIENTS = {
  * NULL = not yet deployed. Set after deploying the factory.
  */
 export const BONDING_CURVE_FACTORY: Record<number, `0x${string}` | null> = {
-  // Base Sepolia only; null until a verified factory deployment is supplied.
-  84532: null,
+  // Verified Base Sepolia testnet factory deployment.
+  84532: "0x4Ed3f3925D1cd5fEd721Baf49A8a7f557dA62572" as `0x${string}`,
   // BNB Smart Chain Testnet only; null until a verified factory deployment is supplied.
   97: null,
 };
