@@ -111,18 +111,29 @@ async function main() {
   const createNonce = latestNonce > pendingNonce ? latestNonce : pendingNonce;
   assert.ok(Number.isSafeInteger(createNonce), `create nonce is invalid: ${createNonce}`);
   const createFactory = factory.connect(creatorSigner);
-  const createReceipt = await stage("token creation", () => sendAndWait("createToken", createFactory.createToken("Anvil Meme", "ANV", 10_000, 1_000_000_000n, 1_000_000_000n, { nonce: createNonce }), provider));
-  // The explicit createToken nonce is only needed for the stale-pending edge
-  // case. Start a fresh manager after its receipt so subsequent creator txs are
-  // serialized from the provider's current pending nonce.
+  // Do not infer the mined nonce from a post-receipt transaction-count query:
+  // some Anvil/RPC combinations cache both latest and pending counts. Inspect the
+  // submitted transaction and its confirmed receipt instead.
+  const createTx = await withTimeout(createFactory.createToken("Anvil Meme", "ANV", 10_000, 1_000_000_000n, 1_000_000_000n, { nonce: createNonce }), "createToken submission timed out");
+  assert.ok(createTx?.hash, "createToken did not return a transaction hash");
+  const createReceipt = await stage("token creation", () => sendAndWait("createToken", Promise.resolve(createTx), provider));
+  const minedCreateTx = await withTimeout(provider.getTransaction(createTx.hash), "createToken transaction lookup timed out");
+  assert.ok(minedCreateTx, `createToken transaction ${createTx.hash} not found after receipt confirmation`);
+  assert.equal(createReceipt?.status, 1, "createToken receipt status was not successful");
+  assert.equal(getAddress(createReceipt.from), actualDeployer, "createToken receipt sender mismatch");
+  assert.equal(getAddress(minedCreateTx.from), actualDeployer, "createToken transaction sender mismatch");
+  const minedCreateNonce = minedCreateTx.nonce;
+  assert.ok(Number.isSafeInteger(minedCreateNonce), `mined create nonce is invalid: ${minedCreateNonce}`);
+  assert.equal(minedCreateNonce, createNonce, "createToken nonce differs from the submitted nonce");
+  // Refresh state once more, but use the confirmed transaction nonce as the
+  // source of truth. Seed a NonceManager to the next nonce even if pending is
+  // stale; all subsequent creator transactions then serialize locally.
+  await provider.getBlockNumber();
+  const refreshedPendingNonce = Number(await provider.send("eth_getTransactionCount", [actualDeployer, "pending"]));
+  const nextCreatorNonce = minedCreateNonce + 1;
   creatorSigner = new NonceManager(new Wallet(creatorKey, provider));
-  const latestAfterCreate = await provider.getTransactionCount(actualDeployer, "latest");
-  const pendingAfterCreate = await provider.getTransactionCount(actualDeployer, "pending");
-  console.error(`[bnb-anvil] after createToken; latest nonce ${latestAfterCreate}; pending nonce ${pendingAfterCreate}`);
-  assert.ok(latestAfterCreate > createNonce, `nonce did not advance after createToken: latest ${latestAfterCreate}, create ${createNonce}`);
-  // Seed NonceManager past another stale pending response, if necessary. Its
-  // internal delta then keeps all later creator transactions sequential.
-  for (let nonce = pendingAfterCreate; nonce < latestAfterCreate; nonce += 1) creatorSigner.increment();
+  for (let nonce = refreshedPendingNonce; nonce < nextCreatorNonce; nonce += 1) creatorSigner.increment();
+  console.error(`[bnb-anvil] createToken mined nonce ${minedCreateNonce}; refreshed pending nonce ${refreshedPendingNonce}; next creator nonce ${nextCreatorNonce}`);
   const created = createReceipt.logs.map(log => { try { return factory.interface.parseLog(log); } catch { return null; } }).find(event => event?.name === "TokenCreated");
   assert.ok(created, "TokenCreated event missing");
   const tokenAddress = getAddress(created.args.token);
