@@ -99,4 +99,3 @@ jobs:
           if [ -f "$RUNNER_TEMP/anvil.log" ]; then
             cat "$RUNNER_TEMP/anvil.log"
           fi
-/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
