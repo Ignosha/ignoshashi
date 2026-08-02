@@ -71,24 +71,40 @@ async function main() {
   const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: false });
   const chainId = BigInt(await stage("RPC chain ID", () => provider.send("eth_chainId", [])));
   assert.equal(chainId, 31337n, `expected Anvil chain ID 31337, got ${chainId}`);
-  const signer = new Wallet(process.env.BNB_TEST_PRIVATE_KEY?.trim() || ANVIL_DEFAULT_KEY, provider);
-  const creator = await signer.getAddress();
+  const creatorKey = process.env.BNB_TEST_PRIVATE_KEY?.trim() || ANVIL_DEFAULT_KEY;
+  // The factory deployer is intentionally the same deterministic creator wallet used for
+  // createToken. Reusing this provider-backed Wallet avoids silently selecting a different
+  // account while manually supplying the post-deployment pending nonce.
+  const creatorSigner = new Wallet(creatorKey, provider);
+  const deployer = await creatorSigner.getAddress();
+  const creator = deployer;
+  assert.equal(deployer, creator, "factory deployer and token creator must match");
+  console.error(`[bnb-anvil] deployer ${deployer}; creator ${creator}`);
+  console.error(`[bnb-anvil] signer identity verified before deployment`);
   const platformSigner = new Wallet(process.env.BNB_TEST_PLATFORM_PRIVATE_KEY?.trim() || ANVIL_PLATFORM_KEY, provider);
   const platform = getAddress(process.env.BNB_TEST_PLATFORM_ADDRESS?.trim() || await platformSigner.getAddress());
   assert.equal(platform, await platformSigner.getAddress(), "BNB_TEST_PLATFORM_ADDRESS must match the supplied local platform key");
   const outsider = Wallet.createRandom().connect(provider);
 
+  const deploymentNonce = await provider.getTransactionCount(creator, "pending");
   const factory = await stage("factory deployment", async () => {
-    const deployed = await new ContractFactory(factoryArtifact.abi, factoryArtifact.bytecode, signer).deploy(platform, 100, 5000);
-    await withTimeout(deployed.waitForDeployment(), "factory deployment receipt timed out");
+    const deployed = await new ContractFactory(factoryArtifact.abi, factoryArtifact.bytecode, creatorSigner).deploy(platform, 100, 5000, { nonce: deploymentNonce });
+    const deploymentTx = deployed.deploymentTransaction();
+    assert.ok(deploymentTx, "factory deployment transaction missing");
+    await withTimeout(deploymentTx.wait(), "factory deployment receipt timed out");
     return deployed;
   });
   const factoryAddress = await factory.getAddress();
-  const createReceipt = await stage("token creation", () => sendAndWait("createToken", factory.createToken("Anvil Meme", "ANV", 10_000, 1_000_000_000n, 1_000_000_000n), provider));
+  const actualDeployer = await creatorSigner.getAddress();
+  assert.equal(actualDeployer, deployer, "factory signer identity changed unexpectedly");
+  const createNonce = await provider.getTransactionCount(actualDeployer, "pending");
+  console.error(`[bnb-anvil] deployer ${actualDeployer} pending nonce ${createNonce}`);
+  const createFactory = factory.connect(creatorSigner);
+  const createReceipt = await stage("token creation", () => sendAndWait("createToken", createFactory.createToken("Anvil Meme", "ANV", 10_000, 1_000_000_000n, 1_000_000_000n, { nonce: createNonce }), provider));
   const created = createReceipt.logs.map(log => { try { return factory.interface.parseLog(log); } catch { return null; } }).find(event => event?.name === "TokenCreated");
   assert.ok(created, "TokenCreated event missing");
   const tokenAddress = getAddress(created.args.token);
-  const token = new Contract(tokenAddress, tokenArtifact.abi, signer);
+  const token = new Contract(tokenAddress, tokenArtifact.abi, creatorSigner);
 
   await stage("creation assertions", async () => { assert.equal(await factory.tokenCount(), 1n); assert.equal(await token.balanceOf(tokenAddress), 10_000n); assert.equal(await token.creator(), creator); });
   const amount = 100n;
