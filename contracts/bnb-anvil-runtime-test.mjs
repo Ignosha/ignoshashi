@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { Contract, ContractFactory, JsonRpcProvider, Wallet, NonceManager, getAddress } from "ethers";
+import { Contract, ContractFactory, JsonRpcProvider, Wallet, getAddress } from "ethers";
 
 const root = resolve(import.meta.dirname, "..");
 const artifactPath = resolve(root, "src/contracts/abis/BnbSmartChainTestnetTokenFactory.json");
@@ -40,17 +40,26 @@ async function stage(name, action) {
     throw new Error(`${name}: ${error?.shortMessage || error?.reason || error?.message || error}`);
   }
 }
-async function sendAndWait(label, txPromise) {
+async function sendAndWait(label, txPromise, provider) {
   const tx = await withTimeout(txPromise, `${label} submission timed out`);
   assert.ok(tx?.hash, `${label} did not return a transaction hash`);
   console.error(`[bnb-anvil] SUBMITTED ${label} ${tx.hash}`);
-  const receipt = await withTimeout(tx.wait(), `${label} receipt timed out`);
-  console.error(`[bnb-anvil] RECEIPT ${label}`);
-  return receipt;
+  try {
+    const receipt = await withTimeout(tx.wait(), `${label} receipt timed out`);
+    assert.equal(receipt?.status, 1, `${label} receipt status was not successful`);
+    console.error(`[bnb-anvil] RECEIPT ${label}`);
+    return receipt;
+  } catch (error) {
+    // Keep the receipt assertion strict, but expose whether the hash is pending or failed.
+    const status = await withTimeout(provider.getTransactionReceipt(tx.hash), `${label} diagnostic receipt lookup timed out`, 2_000).catch(() => null);
+    const pending = status === null;
+    const reason = error?.message || error;
+    throw new Error(`${label} receipt wait failed: ${reason} (hash ${tx.hash}; ${pending ? "still pending" : `status ${status.status}`})`);
+  }
 }
 async function expectRevert(action, expected, label = `expected ${expected}`) {
   try { await withTimeout(action(), `${label} timed out`); }
-  catch (error) { const text = String(error?.shortMessage || error?.reason || error?.message || error); assert.ok(text.includes(expected), `expected ${expected}, got ${text}`); console.log(`[bnb-anvil] ${label}: observed ${expected}`); return; }
+  catch (error) { const text = String(error?.shortMessage || error?.reason || error?.message || error); assert.ok(text.includes(expected), `expected ${expected}, got ${text}`); console.error(`[bnb-anvil] ${label}: observed ${expected}`); return; }
   assert.fail(`expected transaction to revert with ${expected}`);
 }
 
@@ -62,9 +71,9 @@ async function main() {
   const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: false });
   const chainId = BigInt(await stage("RPC chain ID", () => provider.send("eth_chainId", [])));
   assert.equal(chainId, 31337n, `expected Anvil chain ID 31337, got ${chainId}`);
-  const signer = new NonceManager(new Wallet(process.env.BNB_TEST_PRIVATE_KEY?.trim() || ANVIL_DEFAULT_KEY, provider));
+  const signer = new Wallet(process.env.BNB_TEST_PRIVATE_KEY?.trim() || ANVIL_DEFAULT_KEY, provider);
   const creator = await signer.getAddress();
-  const platformSigner = new NonceManager(process.env.BNB_TEST_PLATFORM_PRIVATE_KEY?.trim() ? new Wallet(process.env.BNB_TEST_PLATFORM_PRIVATE_KEY.trim(), provider) : new Wallet(ANVIL_PLATFORM_KEY, provider));
+  const platformSigner = new Wallet(process.env.BNB_TEST_PLATFORM_PRIVATE_KEY?.trim() || ANVIL_PLATFORM_KEY, provider);
   const platform = getAddress(process.env.BNB_TEST_PLATFORM_ADDRESS?.trim() || await platformSigner.getAddress());
   assert.equal(platform, await platformSigner.getAddress(), "BNB_TEST_PLATFORM_ADDRESS must match the supplied local platform key");
   const outsider = Wallet.createRandom().connect(provider);
@@ -75,7 +84,7 @@ async function main() {
     return deployed;
   });
   const factoryAddress = await factory.getAddress();
-  const createReceipt = await stage("token creation", () => sendAndWait("createToken", factory.createToken("Anvil Meme", "ANV", 10_000, 1_000_000_000n, 1_000_000_000n)));
+  const createReceipt = await stage("token creation", () => sendAndWait("createToken", factory.createToken("Anvil Meme", "ANV", 10_000, 1_000_000_000n, 1_000_000_000n), provider));
   const created = createReceipt.logs.map(log => { try { return factory.interface.parseLog(log); } catch { return null; } }).find(event => event?.name === "TokenCreated");
   assert.ok(created, "TokenCreated event missing");
   const tokenAddress = getAddress(created.args.token);
@@ -85,18 +94,17 @@ async function main() {
   const amount = 100n;
   const [cost, fee] = await stage("buy quote", () => token.getBuyCost(amount));
   const total = cost + fee;
-  await stage("buy", () => sendAndWait("buy", token.buy(amount, total, BigInt(Math.floor(Date.now() / 1000) + 300), { value: total })));
+  await stage("buy", () => sendAndWait("buy", token.buy(amount, total, BigInt(Math.floor(Date.now() / 1000) + 300), { value: total }), provider));
   await stage("buy assertions", async () => { assert.equal(await token.balanceOf(creator), amount); assert.equal(await token.trackedGraduationReserve(), cost); assert.equal(await token.feeCredits(platform), fee / 2n); assert.equal(await token.feeCredits(creator), fee - fee / 2n); });
   await stage("buy revert assertions", async () => { await expectRevert(() => token.buy(1, total, 0, { value: total }), "DEADLINE", "buy deadline revert"); await expectRevert(() => token.buy(1, 0, BigInt(Math.floor(Date.now() / 1000) + 300), { value: total }), "SLIPPAGE", "buy slippage revert"); });
   const sellAmount = 40n;
   const [proceeds, sellFee] = await stage("sell quote", () => token.getSellProceeds(sellAmount));
   const net = proceeds - sellFee;
-  await stage("approval", () => sendAndWait("approve", token.approve(tokenAddress, sellAmount)));
-  signer.reset();
-  await stage("sell", () => sendAndWait("sell", token.sell(sellAmount, net, BigInt(Math.floor(Date.now() / 1000) + 300))));
+  await stage("approval", () => sendAndWait("approve", token.approve(tokenAddress, sellAmount), provider));
+  await stage("sell", () => sendAndWait("sell", token.sell(sellAmount, net, BigInt(Math.floor(Date.now() / 1000) + 300)), provider));
   await stage("sell assertions", async () => { assert.equal(await token.balanceOf(creator), amount - sellAmount); assert.equal(await token.trackedGraduationReserve(), cost - net); assert.equal(await token.feeCredits(platform), fee / 2n + sellFee / 2n); assert.equal(await token.feeCredits(creator), fee - fee / 2n + sellFee - sellFee / 2n); });
   await stage("sell revert assertions", async () => { await expectRevert(() => token.sell(1, net + 1n, BigInt(Math.floor(Date.now() / 1000) + 300)), "SLIPPAGE", "sell slippage revert"); await expectRevert(() => token.sell(1, 0, 0), "DEADLINE", "sell deadline revert"); });
-  await stage("fee withdrawal assertions", async () => { const outsiderToken = token.connect(outsider); await expectRevert(() => outsiderToken.withdrawFees(), "NO_FEES", "outsider fee withdrawal revert"); await sendAndWait("platform fee withdrawal", token.connect(platformSigner).withdrawFees()); assert.equal(await token.feeCredits(platform), 0n); await sendAndWait("creator fee withdrawal", token.withdrawFees()); assert.equal(await token.feeCredits(creator), 0n); });
+  await stage("fee withdrawal assertions", async () => { const outsiderToken = token.connect(outsider); await expectRevert(() => outsiderToken.withdrawFees(), "NO_FEES", "outsider fee withdrawal revert"); await sendAndWait("platform fee withdrawal", token.connect(platformSigner).withdrawFees(), provider); assert.equal(await token.feeCredits(platform), 0n); await sendAndWait("creator fee withdrawal", token.withdrawFees(), provider); assert.equal(await token.feeCredits(creator), 0n); });
   await stage("graduation gate assertions", async () => { await expectRevert(() => token.requestGraduation(outsider.address), "BNB_GRADUATION_GATED", "outsider graduation request"); await expectRevert(() => token.executeGraduation(), "BNB_GRADUATION_GATED", "graduation execution"); });
   console.log(`PASS BNB Anvil runtime: chain ${chainId}, factory ${factoryAddress}, token ${tokenAddress}`);
   console.log("PASS create, custody, buy/sell, fee credits/withdrawal, deadline/slippage, and graduation gates");
