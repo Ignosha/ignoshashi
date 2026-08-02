@@ -43,18 +43,18 @@ async function stage(name, action) {
 async function sendAndWait(label, txPromise, provider) {
   const tx = await withTimeout(txPromise, `${label} submission timed out`);
   assert.ok(tx?.hash, `${label} did not return a transaction hash`);
-  console.error(`[bnb-anvil] SUBMITTED ${label} ${tx.hash}`);
+  console.error(`[bnb-anvil] SUBMITTED ${label} sender ${tx.from || "unknown"} nonce ${tx.nonce ?? "unknown"} hash ${tx.hash}`);
   try {
     const receipt = await withTimeout(tx.wait(), `${label} receipt timed out`);
     assert.equal(receipt?.status, 1, `${label} receipt status was not successful`);
-    console.error(`[bnb-anvil] RECEIPT ${label}`);
+    console.error(`[bnb-anvil] RECEIPT ${label} status ${receipt.status} block ${receipt.blockNumber} tx ${receipt.hash || tx.hash}`);
     return receipt;
   } catch (error) {
     // Keep the receipt assertion strict, but expose whether the hash is pending or failed.
     const status = await withTimeout(provider.getTransactionReceipt(tx.hash), `${label} diagnostic receipt lookup timed out`, 2_000).catch(() => null);
     const pending = status === null;
     const reason = error?.message || error;
-    throw new Error(`${label} receipt wait failed: ${reason} (hash ${tx.hash}; ${pending ? "still pending" : `status ${status.status}`})`);
+    throw new Error(`${label} receipt wait failed: ${reason} (hash ${tx.hash}; ${pending ? "still pending" : `status ${status.status}, block ${status.blockNumber}`})`);
   }
 }
 async function expectRevert(action, expected, label = `expected ${expected}`) {
@@ -183,7 +183,38 @@ async function main() {
   await stage("sell", () => sendAndWait("sell", sellToken.sell(sellAmount, net, BigInt(Math.floor(Date.now() / 1000) + 300)), holderProvider));
   await stage("sell assertions", async () => { assert.equal(await sellToken.balanceOf(creator), amount - sellAmount); assert.equal(await sellToken.trackedGraduationReserve(), cost - net); assert.equal(await sellToken.feeCredits(platform), fee / 2n + sellFee / 2n); assert.equal(await sellToken.feeCredits(creator), fee - fee / 2n + sellFee - sellFee / 2n); });
   await stage("sell revert assertions", async () => { await expectRevert(() => sellToken.sell(1, net + 1n, BigInt(Math.floor(Date.now() / 1000) + 300)), "SLIPPAGE", "sell slippage revert"); await expectRevert(() => sellToken.sell(1, 0, 0), "DEADLINE", "sell deadline revert"); });
-  await stage("fee withdrawal assertions", async () => { const outsiderToken = token.connect(outsider); await expectRevert(() => outsiderToken.withdrawFees(), "NO_FEES", "outsider fee withdrawal revert"); await sendAndWait("platform fee withdrawal", token.connect(platformSigner).withdrawFees(), provider); assert.equal(await sellToken.feeCredits(platform), 0n); await sendAndWait("creator fee withdrawal", sellToken.withdrawFees(), holderProvider); assert.equal(await sellToken.feeCredits(creator), 0n); });
+  await stage("fee withdrawal assertions", async () => {
+    const outsiderToken = token.connect(outsider);
+    await expectRevert(() => outsiderToken.withdrawFees(), "NO_FEES", "outsider fee withdrawal revert");
+    const platformReceipt = await sendAndWait("platform fee withdrawal", token.connect(platformSigner).withdrawFees(), provider);
+    assert.equal(await sellToken.feeCredits(platform), 0n);
+
+    // Do not reuse holderSigner here: it has its own provider/NonceManager state, while
+    // the platform withdrawal may consume the same deterministic Anvil address/nonce.
+    // Build the creator signer from the actual creator key on a fresh provider and seed
+    // its nonce from the confirmed platform receipt when both roles share an address.
+    const creatorProvider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: false });
+    const creatorWallet = new Wallet(creatorKey, creatorProvider);
+    const creatorAddress = await creatorWallet.getAddress();
+    assert.equal(creatorAddress, creator, "creator withdrawal signer identity mismatch");
+    const platformAddress = getAddress(platformReceipt.from);
+    const platformTx = await withTimeout(creatorProvider.getTransaction(platformReceipt.hash), "platform withdrawal transaction lookup timed out");
+    assert.ok(platformTx, `platform withdrawal transaction ${platformReceipt.hash} not found after receipt confirmation`);
+    const latestCreatorNonce = await withTimeout(creatorProvider.getTransactionCount(creatorAddress, "latest"), "creator withdrawal latest nonce lookup timed out");
+    const pendingCreatorNonce = await withTimeout(creatorProvider.getTransactionCount(creatorAddress, "pending"), "creator withdrawal pending nonce lookup timed out");
+    const platformTxNonce = platformAddress === creatorAddress ? platformTx.nonce : null;
+    const creatorWithdrawalNonce = platformTxNonce === null
+      ? Math.max(latestCreatorNonce, pendingCreatorNonce)
+      : Math.max(latestCreatorNonce, pendingCreatorNonce, platformTxNonce + 1);
+    assert.ok(Number.isSafeInteger(creatorWithdrawalNonce), `creator withdrawal nonce is invalid: ${creatorWithdrawalNonce}`);
+    const creatorSigner = new NonceManager(creatorWallet);
+    for (let nonce = pendingCreatorNonce; nonce < creatorWithdrawalNonce; nonce += 1) creatorSigner.increment();
+    const creatorToken = new Contract(tokenAddress, tokenArtifact.abi, creatorSigner);
+    console.error(`[bnb-anvil] creator withdrawal signer ${creatorAddress}; platform sender ${platformAddress}; platform nonce ${platformTx.nonce}; latest ${latestCreatorNonce}; pending ${pendingCreatorNonce}; creator nonce ${creatorWithdrawalNonce}`);
+    const creatorReceipt = await sendAndWait("creator fee withdrawal", creatorToken.withdrawFees(), creatorProvider);
+    assert.equal(creatorReceipt?.status, 1, "creator fee withdrawal receipt status was not successful");
+    assert.equal(await creatorToken.feeCredits(creator), 0n);
+  });
   await stage("graduation gate assertions", async () => { await expectRevert(() => token.requestGraduation(outsider.address), "BNB_GRADUATION_GATED", "outsider graduation request"); await expectRevert(() => token.executeGraduation(), "BNB_GRADUATION_GATED", "graduation execution"); });
   console.log(`PASS BNB Anvil runtime: chain ${chainId}, factory ${factoryAddress}, token ${tokenAddress}`);
   console.log("PASS create, custody, buy/sell, fee credits/withdrawal, deadline/slippage, and graduation gates");
