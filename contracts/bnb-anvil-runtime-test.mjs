@@ -29,15 +29,24 @@ async function withTimeout(promise, message, ms = STEP_TIMEOUT) {
   finally { clearTimeout(timer); }
 }
 async function stage(name, action) {
-  console.log(`[bnb-anvil] ${name}...`);
-  try { const result = await withTimeout(action(), `${name} timed out after ${STEP_TIMEOUT}ms`); console.log(`[bnb-anvil] ${name}: ok`); return result; }
-  catch (error) { throw new Error(`${name}: ${error?.shortMessage || error?.reason || error?.message || error}`); }
+  // stderr is intentionally used for markers: Actions streams it even when a step is killed.
+  const startedAt = Date.now();
+  console.error(`[bnb-anvil] START ${name}`);
+  try {
+    const result = await withTimeout(Promise.resolve().then(action), `${name} timed out after ${STEP_TIMEOUT}ms`);
+    console.error(`[bnb-anvil] DONE ${name} (+${Date.now() - startedAt}ms)`);
+    return result;
+  } catch (error) {
+    throw new Error(`${name}: ${error?.shortMessage || error?.reason || error?.message || error}`);
+  }
 }
 async function sendAndWait(label, txPromise) {
   const tx = await withTimeout(txPromise, `${label} submission timed out`);
   assert.ok(tx?.hash, `${label} did not return a transaction hash`);
-  console.log(`[bnb-anvil] ${label}: submitted ${tx.hash}`);
-  return withTimeout(tx.wait(), `${label} receipt timed out`);
+  console.error(`[bnb-anvil] SUBMITTED ${label} ${tx.hash}`);
+  const receipt = await withTimeout(tx.wait(), `${label} receipt timed out`);
+  console.error(`[bnb-anvil] RECEIPT ${label}`);
+  return receipt;
 }
 async function expectRevert(action, expected, label = `expected ${expected}`) {
   try { await withTimeout(action(), `${label} timed out`); }
