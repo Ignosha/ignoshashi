@@ -1,3 +1,4 @@
+# Workflow registration refresh: harmless metadata-only change.
 name: BNB Anvil runtime harness
 
 on:
