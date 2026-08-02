@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { Contract, ContractFactory, JsonRpcProvider, Wallet, getAddress } from "ethers";
+import { Contract, ContractFactory, JsonRpcProvider, Wallet, NonceManager, getAddress } from "ethers";
 
 const root = resolve(import.meta.dirname, "..");
 const artifactPath = resolve(root, "src/contracts/abis/BnbSmartChainTestnetTokenFactory.json");
@@ -73,9 +73,9 @@ async function main() {
   assert.equal(chainId, 31337n, `expected Anvil chain ID 31337, got ${chainId}`);
   const creatorKey = process.env.BNB_TEST_PRIVATE_KEY?.trim() || ANVIL_DEFAULT_KEY;
   // The factory deployer is intentionally the same deterministic creator wallet used for
-  // createToken. Reusing this provider-backed Wallet avoids silently selecting a different
-  // account while manually supplying the post-deployment pending nonce.
-  const creatorSigner = new Wallet(creatorKey, provider);
+  // createToken. Reusing this provider-backed wallet avoids silently selecting a different
+  // account while supplying the confirmed post-deployment nonce when pending is stale.
+  let creatorSigner = new Wallet(creatorKey, provider);
   const deployer = await creatorSigner.getAddress();
   const creator = deployer;
   assert.equal(deployer, creator, "factory deployer and token creator must match");
@@ -105,9 +105,24 @@ async function main() {
   console.error(`[bnb-anvil] deployer ${actualDeployer}; deployment tx nonce ${deploymentNonce}; latest nonce ${latestNonce}; pending nonce ${pendingNonce}`);
   assert.ok(Number.isSafeInteger(deploymentNonce), `deployment nonce is invalid: ${deploymentNonce}`);
   assert.ok(latestNonce > deploymentNonce, `nonce inconsistent after factory deployment: latest ${latestNonce}, deployment tx ${deploymentNonce}`);
-  assert.ok(pendingNonce >= latestNonce, `nonce inconsistent after factory deployment: pending ${pendingNonce}, latest ${latestNonce}`);
+  // Some Anvil environments report a stale pending nonce after a receipt. The
+  // confirmed latest nonce is authoritative for this next createToken tx; retain
+  // the diagnostic pending value but do not reject it when it lags latest.
+  const createNonce = latestNonce > pendingNonce ? latestNonce : pendingNonce;
+  assert.ok(Number.isSafeInteger(createNonce), `create nonce is invalid: ${createNonce}`);
   const createFactory = factory.connect(creatorSigner);
-  const createReceipt = await stage("token creation", () => sendAndWait("createToken", createFactory.createToken("Anvil Meme", "ANV", 10_000, 1_000_000_000n, 1_000_000_000n), provider));
+  const createReceipt = await stage("token creation", () => sendAndWait("createToken", createFactory.createToken("Anvil Meme", "ANV", 10_000, 1_000_000_000n, 1_000_000_000n, { nonce: createNonce }), provider));
+  // The explicit createToken nonce is only needed for the stale-pending edge
+  // case. Start a fresh manager after its receipt so subsequent creator txs are
+  // serialized from the provider's current pending nonce.
+  creatorSigner = new NonceManager(new Wallet(creatorKey, provider));
+  const latestAfterCreate = await provider.getTransactionCount(actualDeployer, "latest");
+  const pendingAfterCreate = await provider.getTransactionCount(actualDeployer, "pending");
+  console.error(`[bnb-anvil] after createToken; latest nonce ${latestAfterCreate}; pending nonce ${pendingAfterCreate}`);
+  assert.ok(latestAfterCreate > createNonce, `nonce did not advance after createToken: latest ${latestAfterCreate}, create ${createNonce}`);
+  // Seed NonceManager past another stale pending response, if necessary. Its
+  // internal delta then keeps all later creator transactions sequential.
+  for (let nonce = pendingAfterCreate; nonce < latestAfterCreate; nonce += 1) creatorSigner.increment();
   const created = createReceipt.logs.map(log => { try { return factory.interface.parseLog(log); } catch { return null; } }).find(event => event?.name === "TokenCreated");
   assert.ok(created, "TokenCreated event missing");
   const tokenAddress = getAddress(created.args.token);
