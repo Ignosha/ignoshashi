@@ -4,11 +4,12 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { readFileSync } from "node:fs";
 import solc from "solc";
-import { Contract, ContractFactory, JsonRpcProvider, NonceManager, Wallet } from "ethers";
+import { Contract, ContractFactory, JsonRpcProvider, NonceManager, Wallet, getCreateAddress } from "ethers";
 
 const dir = new URL(".", import.meta.url);
 const anvil = "/home/team/shared/tools/anvil/anvil";
 let anvilProcess;
+let activeProvider;
 
 async function unusedPort() {
   const server = createServer();
@@ -51,14 +52,41 @@ function compile() {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const TX_TIMEOUT_MS = 15_000;
+async function withTimeout(promise, label) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${TX_TIMEOUT_MS}ms`)), TX_TIMEOUT_MS); })]);
+  } finally { clearTimeout(timer); }
+}
 async function deploy(artifact, signer, ...args) {
-  const contract = await new ContractFactory(artifact.abi, artifact.bytecode, signer).deploy(...args);
-  await contract.waitForDeployment();
+  const factory = new ContractFactory(artifact.abi, artifact.bytecode, signer);
+  const nonce = await signer.getNonce("pending");
+  const gas = await factory.getDeployTransaction(...args).then((tx) => signer.estimateGas(tx));
+  const expected = getCreateAddress({ from: await signer.getAddress(), nonce });
+  console.log(`[tx] deploy ${args[0] ?? "contract"} nonce=${nonce} gas=${gas} expected=${expected}`);
+  const contract = await withTimeout(factory.deploy(...args), `deploy ${args[0] ?? "contract"}`);
+  const tx = contract.deploymentTransaction();
+  console.log(`[tx] deploy ${args[0] ?? "contract"} hash=${tx?.hash ?? "unknown"}`);
+  await withTimeout(contract.waitForDeployment(), `receipt deploy ${args[0] ?? "contract"}`);
+  console.log(`[tx] deployed ${args[0] ?? "contract"} address=${await contract.getAddress()}`);
   return contract;
+}
+async function waitTx(txPromise, label) {
+  const tx = await withTimeout(txPromise, `${label} submission`);
+  console.log(`[tx] ${label} hash=${tx.hash} nonce=${tx.nonce} gas=${tx.gasLimit}`);
+  await withTimeout(activeProvider.waitForTransaction(tx.hash, 1, TX_TIMEOUT_MS), `${label} receipt`);
 }
 async function expectRevert(action, text) {
   try {
-    await action();
+    const result = await action();
+    // Some revert paths are only detected when the submitted transaction is mined;
+    // always drain that receipt so NonceManager cannot leave a gap for later cases.
+    if (result && typeof result.wait === "function") {
+      const tx = result;
+      console.log(`[tx] expected revert ${text} hash=${tx.hash} nonce=${tx.nonce} gas=${tx.gasLimit}`);
+      await withTimeout(tx.wait(), `expected revert ${text} receipt`);
+    }
     assert.fail(`expected ${text}`);
   } catch (error) {
     if (String(error.message).startsWith("expected ")) throw error;
@@ -78,8 +106,11 @@ async function main() {
   anvilProcess.once("exit", (code, signal) => { if (code !== 0 && signal !== "SIGTERM") console.error(`[stage] owned Anvil exited code=${code} signal=${signal}`); });
   await sleep(500);
   const provider = new JsonRpcProvider(`http://127.0.0.1:${port}`, 31337, { staticNetwork: true, batchMaxCount: 1 });
+  activeProvider = provider;
   await waitForRpc(provider);
   const signerWallet = new Wallet("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", provider);
+  // A plain Wallet lets ethers/provider reconcile pending nonces after constructor reverts;
+  // NonceManager can retain a local gap when an expected-revert deployment is mined.
   const signer = new NonceManager(signerWallet);
   const timelock = new Wallet("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d", provider);
   assert.equal((await provider.getNetwork()).chainId, 31337n);
@@ -93,39 +124,39 @@ async function main() {
   const router = await deploy(A.router, signer, await factory.getAddress(), await wbnb.getAddress());
   const wrongWbnb = await deploy(A.token, signer, "WRONG_WBNB");
   const mismatchedRouter = await deploy(A.router, signer, await factory.getAddress(), await wrongWbnb.getAddress());
-  await expectRevert(
+    await expectRevert(
     async () => deploy(A.adapter, signer, await factory.getAddress(), await mismatchedRouter.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress()),
     "INVALID_CONFIGURATION",
   );
   const adapter = await deploy(A.adapter, signer, await factory.getAddress(), await router.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
   const token = await deploy(A.token, signer, "TOKEN");
-  await (await registry.set(signerAddress, await token.getAddress(), true)).wait();
+  await waitTx(registry.set(signerAddress, await token.getAddress(), true), "registry.set");
   const base = [100, 1, 99, 1, 9999999999, 1, timelock.address];
 
   await expectRevert(async () => adapter.graduate(await token.getAddress(), base, { value: 1 }), "allowance");
-  await (await token.approve(await adapter.getAddress(), 100)).wait();
-  await (await token.mint(signer.address, 1000)).wait();
+  await waitTx(token.approve(await adapter.getAddress(), 100), "token.approve adapter");
+  await waitTx(token.mint(signer.address, 1000), "token.mint");
   await expectRevert(async () => adapter.graduate(await token.getAddress(), [...base.slice(0, 6), signer.address], { value: 1 }), "WrongTimelock");
   await expectRevert(async () => adapter.graduate(await token.getAddress(), base, { value: 2 }), "NativeAmountMismatch");
   await expectRevert(async () => adapter.graduate(await token.getAddress(), [100, 1, 101, 1, ...base.slice(4)], { value: 1 }), "InvalidParams");
   await expectRevert(async () => adapter.graduate(await token.getAddress(), [100, 1, 99, 1, 1, ...base.slice(5)], { value: 1 }), "InvalidParams");
 
   const wrongPair = await deploy(A.pair, signer, await wbnb.getAddress(), timelock.address);
-  await (await factory.setPair(await wrongPair.getAddress())).wait();
+  await waitTx(factory.setPair(await wrongPair.getAddress()), "factory.setPair wrong");
   await expectRevert(async () => adapter.graduate(await token.getAddress(), base, { value: 1 }), "WrongPair");
 
   const factory2 = await deploy(A.factory, signer);
   const router2 = await deploy(A.router, signer, await factory2.getAddress(), await wbnb.getAddress());
   const adapter2 = await deploy(A.adapter, signer, await factory2.getAddress(), await router2.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
-  await (await router2.setLiquidity(0)).wait();
-  await (await token.approve(await adapter2.getAddress(), 100)).wait();
+  await waitTx(router2.setLiquidity(0), "router2.setLiquidity");
+  await waitTx(token.approve(await adapter2.getAddress(), 100), "token.approve adapter2");
   await expectRevert(async () => adapter2.graduate(await token.getAddress(), base, { value: 1 }), "ZeroLiquidity");
 
   const factory3 = await deploy(A.factory, signer);
   const router3 = await deploy(A.router, signer, await factory3.getAddress(), await wbnb.getAddress());
   const adapter3 = await deploy(A.adapter, signer, await factory3.getAddress(), await router3.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
-  await (await token.approve(await adapter3.getAddress(), 100)).wait();
-  await (await adapter3.graduate(await token.getAddress(), base, { value: 1 })).wait();
+  await waitTx(token.approve(await adapter3.getAddress(), 100), "token.approve adapter3");
+  await waitTx(adapter3.graduate(await token.getAddress(), base, { value: 1 }), "adapter3.graduate");
   const pairAddress = await factory3.getPair(await token.getAddress(), await wbnb.getAddress());
   const pair = new Contract(pairAddress, A.pair.abi, provider);
   assert.equal(await pair.balanceOf(timelock.address), 1n);
@@ -135,14 +166,13 @@ async function main() {
 
   const router4 = await deploy(A.router, signer, await factory3.getAddress(), await wbnb.getAddress());
   const adapter4 = await deploy(A.adapter, signer, await factory3.getAddress(), await router4.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
-  await (await router4.setActualToken(99, true)).wait();
-  await (await token.approve(await adapter4.getAddress(), 100)).wait();
+  await waitTx(router4.setActualToken(99, true), "router4.setActualToken");
+  await waitTx(token.approve(await adapter4.getAddress(), 100), "token.approve adapter4");
   await expectRevert(async () => adapter4.graduate(await token.getAddress(), base, { value: 1 }), "Slippage");
 
   console.log("[stage] assertions complete");
   console.log("PASS adapter runtime: constructor configuration, authorization, timelock/amount/parameter checks, pair validation, zero liquidity, LP custody, allowance reset, replay, and slippage rollback");
 }
-
 main().catch((error) => {
   console.error(`FAIL adapter runtime: ${error.stack ?? error.message}`);
   process.exitCode = 1;
