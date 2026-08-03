@@ -23,8 +23,10 @@ jobs:
     timeout-minutes: 20
     env:
       ANVIL_PORT: '8545'
-      ANVIL_LOG: ${{ runner.temp }}/bnb-anvil.log
-      ANVIL_PID: ${{ runner.temp }}/bnb-anvil.pid
+      # runner context is unavailable while evaluating job-level env; use the
+      # runner's stable temporary directory instead of ${{ runner.temp }} here.
+      ANVIL_LOG: /tmp/bnb-anvil.log
+      ANVIL_PID: /tmp/bnb-anvil.pid
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -121,4 +123,3 @@ jobs:
             kill -KILL "$(cat "$ANVIL_PID")" 2>/dev/null || true
           fi
           test ! -f "$ANVIL_LOG" || cat "$ANVIL_LOG"
-/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
