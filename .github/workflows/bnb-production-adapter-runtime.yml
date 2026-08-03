@@ -23,12 +23,13 @@ jobs:
     timeout-minutes: 20
     env:
       ANVIL_PORT: '8545'
-      # runner context is unavailable while evaluating job-level env; use the
-      # runner's stable temporary directory instead of ${{ runner.temp }} here.
+      # The Pancake harness owns 18545. This workflow Anvil is only for the
+      # legacy production and mock harnesses and never shares that port.
       ANVIL_LOG: /tmp/bnb-anvil.log
       ANVIL_PID: /tmp/bnb-anvil.pid
       PANCAKE_ADAPTER_LOG: /tmp/pancake-adapter-runtime.log
       PRODUCTION_HARNESS_LOG: /tmp/bnb-production-v1-harness.log
+      DIAGNOSTIC_DIR: /tmp/bnb-adapter-runtime-diagnostics
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -38,12 +39,11 @@ jobs:
         with:
           node-version: 22
 
-      # Keep the runner install small: the harnesses only need the pinned EVM
-      # tooling already declared by this repository, not the web app bundle.
       - name: Install pinned harness tooling
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p "$DIAGNOSTIC_DIR"
           npm install --prefix "$RUNNER_TEMP/bnb-runtime-deps" \
             --no-package-lock --ignore-scripts --no-audit --no-fund \
             ethers@6 solc@0.8.36
@@ -57,91 +57,126 @@ jobs:
       - name: Start isolated Anvil
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
+          mkdir -p "$DIAGNOSTIC_DIR"
           anvil --host 127.0.0.1 --port "$ANVIL_PORT" --chain-id 31337 \
             --accounts 10 --balance 10000 --silent >"$ANVIL_LOG" 2>&1 &
+          anvil_status=$?
           echo "$!" >"$ANVIL_PID"
+          echo "$anvil_status" >"$DIAGNOSTIC_DIR/start-anvil.status"
+          ready=1
           for attempt in {1..30}; do
-            if curl --fail --silent --show-error \
+            if curl --max-time 3 --fail --silent --show-error \
               -H 'content-type: application/json' \
               --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
               "http://127.0.0.1:${ANVIL_PORT}" | grep -q '0x7a69'; then
-              exit 0
+              ready=0
+              break
             fi
             sleep 1
           done
-          cat "$ANVIL_LOG"
-          echo 'Anvil did not become ready' >&2
-          exit 1
+          echo "$ready" >"$DIAGNOSTIC_DIR/start-anvil-ready.status"
+          if [ "$ready" -ne 0 ]; then
+            tail -c 200000 "$ANVIL_LOG" >"$DIAGNOSTIC_DIR/start-anvil.log" 2>&1 || true
+            echo 'Anvil did not become ready' >&2
+            exit 1
+          fi
 
       - name: Compile BNB production contract
-        run: timeout --signal=TERM --kill-after=10s 120s node contracts/compile-bnb-production.js
+        shell: bash
+        run: |
+          set +e
+          timeout --signal=TERM --kill-after=10s 120s node contracts/compile-bnb-production.js
+          status=$?
+          echo "$status" >"$DIAGNOSTIC_DIR/compile-bnb-production.status"
+          exit "$status"
 
       - name: Compile Pancake adapter contracts
-        run: timeout --signal=TERM --kill-after=10s 120s node contracts/compile-pancake-adapter.js
+        shell: bash
+        run: |
+          set +e
+          timeout --signal=TERM --kill-after=10s 120s node contracts/compile-pancake-adapter.js
+          status=$?
+          echo "$status" >"$DIAGNOSTIC_DIR/compile-pancake-adapter.status"
+          exit "$status"
 
       - name: Run production V1 harness
         shell: bash
         run: |
-          set -o pipefail
+          set +e
           timeout --signal=TERM --kill-after=10s 120s \
             node contracts/bnb-production-v1-harness.mjs 2>&1 | tee "$PRODUCTION_HARNESS_LOG"
+          status=${PIPESTATUS[0]}
+          echo "$status" >"$DIAGNOSTIC_DIR/production-v1-harness.status"
+          exit "$status"
 
       - name: Run BNB runtime mock tests
-        run: timeout --signal=TERM --kill-after=10s 120s node contracts/bnb-runtime-mock-test.mjs
+        shell: bash
+        run: |
+          set +e
+          timeout --signal=TERM --kill-after=10s 120s node contracts/bnb-runtime-mock-test.mjs
+          status=$?
+          echo "$status" >"$DIAGNOSTIC_DIR/bnb-runtime-mock-test.status"
+          exit "$status"
 
       - name: Make Anvil available to the self-contained harness
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           mkdir -p "$RUNNER_TEMP/bnb-runtime-bin"
           ln -sf "$(command -v anvil)" "$RUNNER_TEMP/bnb-runtime-bin/anvil"
           sudo mkdir -p /home/team/shared/tools/anvil
           sudo ln -sf "$RUNNER_TEMP/bnb-runtime-bin/anvil" /home/team/shared/tools/anvil/anvil
+          status=$?
+          echo "$status" >"$DIAGNOSTIC_DIR/install-harness-anvil.status"
+          exit "$status"
 
       - name: Run Pancake adapter runtime tests
         shell: bash
         run: |
-          set -o pipefail
-          # The self-contained Pancake harness owns 18545; the production and
-          # mock harnesses own 8545. Fail early rather than silently sharing RPC.
-          if curl --fail --silent --show-error \
+          set +e
+          # The Pancake harness owns 18545. The workflow Anvil above owns only
+          # 8545 for legacy tests, so there is no conflicting workflow Anvil.
+          curl --max-time 3 --fail --silent --show-error \
             -H 'content-type: application/json' \
             --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
-            http://127.0.0.1:18545 >/tmp/pancake-port-conflict.json 2>&1; then
+            http://127.0.0.1:18545 >/tmp/pancake-port-conflict.json 2>&1
+          conflict_probe=$?
+          echo "$conflict_probe" >"$DIAGNOSTIC_DIR/pancake-port-probe.status"
+          if [ "$conflict_probe" -eq 0 ]; then
             echo 'Pancake harness port 18545 is already serving; refusing shared ownership' >&2
-            cat /tmp/pancake-port-conflict.json >&2
+            cat /tmp/pancake-port-conflict.json >&2 || true
+            echo 1 >"$DIAGNOSTIC_DIR/pancake-adapter-runtime.status"
             exit 1
           fi
           timeout --signal=TERM --kill-after=10s 180s \
             env PANCAKE_ANVIL_PORT=18545 node contracts/pancake-adapter-runtime-test.mjs 2>&1 | tee "$PANCAKE_ADAPTER_LOG"
+          status=${PIPESTATUS[0]}
+          echo "$status" >"$DIAGNOSTIC_DIR/pancake-adapter-runtime.status"
+          exit "$status"
 
-      - name: Diagnose runtime processes and RPC
+      - name: Capture runtime diagnostics before cleanup
         if: always()
         shell: bash
         run: |
           set +e
-          echo '--- process table ---'
-          ps -eo pid,ppid,stat,etime,args --forest | grep -E '(^ *PID|anvil|node contracts/)' || true
-          echo '--- owned/shared Anvil RPC ---'
-          for port in 8545 18545; do
-            echo "port=$port"
-            curl --max-time 3 --silent --show-error \
-              -H 'content-type: application/json' \
-              --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
-              "http://127.0.0.1:$port" || true
-            curl --max-time 3 --silent --show-error \
-              -H 'content-type: application/json' \
-              --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-              "http://127.0.0.1:$port" || true
-            echo
+          mkdir -p "$DIAGNOSTIC_DIR"
+          timeout 5s ps -eo pid,ppid,stat,etime,args --forest >"$DIAGNOSTIC_DIR/ps.txt" 2>&1 || true
+          timeout 5s ss -lntp >"$DIAGNOSTIC_DIR/ports.txt" 2>&1 || true
+          timeout 5s sh -c 'for p in 8545 18545; do echo "=== RPC $p ==="; curl --max-time 2 --silent --show-error -H "content-type: application/json" --data "{\"jsonrpc\":\"2.0\",\"method\":\"eth_chainId\",\"params\":[],\"id\":1}" "http://127.0.0.1:$p"; echo; done' >"$DIAGNOSTIC_DIR/rpc.txt" 2>&1 || true
+          for log in /tmp/*.log /tmp/*.json; do
+            [ -f "$log" ] || continue
+            name=$(basename "$log")
+            tail -c 200000 "$log" >"$DIAGNOSTIC_DIR/$name" 2>&1 || true
           done
-          echo '--- Anvil log ---'
-          test ! -f "$ANVIL_LOG" || cat "$ANVIL_LOG"
-          echo '--- Pancake harness log ---'
-          test ! -f "$PANCAKE_ADAPTER_LOG" || tail -200 "$PANCAKE_ADAPTER_LOG"
+          for status in "$DIAGNOSTIC_DIR"/*.status; do
+            [ -f "$status" ] || continue
+            printf '%s=' "$(basename "$status")" >>"$DIAGNOSTIC_DIR/exit-statuses.txt"
+            cat "$status" >>"$DIAGNOSTIC_DIR/exit-statuses.txt"
+          done
+          : >"$DIAGNOSTIC_DIR/diagnostics-step.status"
 
-      - name: Upload runtime logs and artifacts
+      - name: Upload runtime logs and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -149,9 +184,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
           path: |
-            ${{ runner.temp }}/bnb-anvil.log
-            /tmp/pancake-adapter-runtime.log
-            /tmp/bnb-production-v1-harness.log
+            /tmp/bnb-adapter-runtime-diagnostics/**
+            /tmp/*.log
+            /tmp/*.json
             contracts/**/artifacts/**
             contracts/artifacts/**
             src/contracts/abis/**
@@ -169,5 +204,3 @@ jobs:
             done
             kill -KILL "$(cat "$ANVIL_PID")" 2>/dev/null || true
           fi
-          test ! -f "$ANVIL_LOG" || cat "$ANVIL_LOG"
-/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
