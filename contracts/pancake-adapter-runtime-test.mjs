@@ -100,7 +100,14 @@ async function deploy(artifact, signer, ...args) {
   // Reserve before estimation so an expected constructor revert cannot reset
   // the nonce boundary for the following deployment.
   const nonce = await nextDeploymentNonce(deploymentProvider, address);
-  const gas = await factory.getDeployTransaction(...args).then((tx) => deploymentSigner.estimateGas({ ...tx, nonce }));
+  let gas;
+  try {
+    gas = await factory.getDeployTransaction(...args).then((tx) => deploymentSigner.estimateGas({ ...tx, nonce }));
+  } catch (error) {
+    // Estimation-only constructor reverts do not consume a nonce.
+    deploymentNonce = nonce;
+    throw error;
+  }
   const expected = getCreateAddress({ from: address, nonce });
   console.log(`[tx] deploy ${args[0] ?? "contract"} signer=${address} nonce=${nonce} gas=${gas} expected=${expected}`);
   const contract = await withTimeout(factory.deploy(...args, { nonce }), `deploy ${args[0] ?? "contract"}`);
