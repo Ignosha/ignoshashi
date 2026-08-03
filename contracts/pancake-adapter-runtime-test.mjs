@@ -53,6 +53,23 @@ function compile() {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const TX_TIMEOUT_MS = 15_000;
+// All constructor attempts use one allocator. In particular, a constructor
+// whose gas estimation reverts must not cause the next constructor to
+// rediscover and reuse the provider's pending nonce.
+let deploymentNonce;
+const submittedDeploymentNonces = new Set();
+async function nextDeploymentNonce(provider, address) {
+  if (deploymentNonce === undefined) {
+    const latest = await provider.getTransactionCount(address, "latest");
+    const pending = await provider.getTransactionCount(address, "pending");
+    deploymentNonce = pending > latest ? pending : latest;
+    console.log(`[nonce] initialized deployment allocator latest=${latest} pending=${pending} next=${deploymentNonce}`);
+  }
+  const nonce = deploymentNonce;
+  deploymentNonce += 1;
+  console.log(`[nonce] reserved deployment nonce=${nonce} next=${deploymentNonce}`);
+  return nonce;
+}
 async function withTimeout(promise, label) {
   let timer;
   try {
@@ -60,23 +77,28 @@ async function withTimeout(promise, label) {
   } finally { clearTimeout(timer); }
 }
 async function deploy(artifact, signer, ...args) {
-  // Use a fresh provider and Wallet for every constructor. This avoids any
-  // JsonRpcProvider nonce/cache state surviving a constructor-estimation revert.
   const deploymentProvider = new JsonRpcProvider(activeProvider._getConnection().url, 31337, { staticNetwork: true, batchMaxCount: 1 });
   const deploymentSigner = new Wallet(signer.privateKey, deploymentProvider);
   const factory = new ContractFactory(artifact.abi, artifact.bytecode, deploymentSigner);
   const address = await deploymentSigner.getAddress();
-  const latest = await deploymentProvider.getTransactionCount(address, "latest");
-  const pending = await deploymentProvider.getTransactionCount(address, "pending");
-  const nonce = pending;
-  const gas = await factory.getDeployTransaction(...args).then((tx) => deploymentSigner.estimateGas(tx));
+  // Reserve before estimation so an expected constructor revert cannot reset
+  // the nonce boundary for the following deployment.
+  const nonce = await nextDeploymentNonce(deploymentProvider, address);
+  const gas = await factory.getDeployTransaction(...args).then((tx) => deploymentSigner.estimateGas({ ...tx, nonce }));
   const expected = getCreateAddress({ from: address, nonce });
-  console.log(`[tx] deploy ${args[0] ?? "contract"} signer=${address} nonce.latest=${latest} nonce.pending=${pending} gas=${gas} expected=${expected}`);
-  const contract = await withTimeout(factory.deploy(...args), `deploy ${args[0] ?? "contract"}`);
+  console.log(`[tx] deploy ${args[0] ?? "contract"} signer=${address} nonce=${nonce} gas=${gas} expected=${expected}`);
+  const contract = await withTimeout(factory.deploy(...args, { nonce }), `deploy ${args[0] ?? "contract"}`);
   const tx = contract.deploymentTransaction();
-  console.log(`[tx] deploy ${args[0] ?? "contract"} hash=${tx?.hash ?? "unknown"}`);
-  await withTimeout(contract.waitForDeployment(), `receipt deploy ${args[0] ?? "contract"}`);
-  console.log(`[tx] deployed ${args[0] ?? "contract"} address=${await contract.getAddress()}`);
+  assert.ok(tx, `deployment ${args[0] ?? "contract"} must expose a transaction`);
+  assert.equal(tx.nonce, nonce, `deployment nonce mismatch for ${args[0] ?? "contract"}`);
+  assert.equal(submittedDeploymentNonces.has(tx.nonce), false, `duplicate submitted deployment nonce ${tx.nonce}`);
+  submittedDeploymentNonces.add(tx.nonce);
+  console.log(`[tx] deploy ${args[0] ?? "contract"} hash=${tx.hash} nonce=${tx.nonce}`);
+  const receipt = await withTimeout(tx.wait(), `receipt deploy ${args[0] ?? "contract"}`);
+  assert.ok(receipt, `deployment ${args[0] ?? "contract"} receipt must be available`);
+  assert.equal(receipt.status, 1, `deployment ${args[0] ?? "contract"} receipt must succeed`);
+  assert.equal(receipt.nonce, nonce, `deployment receipt nonce mismatch for ${args[0] ?? "contract"}`);
+  console.log(`[tx] deployed ${args[0] ?? "contract"} address=${await contract.getAddress()} nonce=${nonce}`);
   return contract;
 }
 async function waitTx(txPromise, label) {
