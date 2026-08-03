@@ -80,9 +80,22 @@ async function withTimeout(promise, label) {
 }
 async function waitForReceipt(provider, hash, label) {
   const deadline = Date.now() + TX_TIMEOUT_MS;
+  let nextLivenessCheck = 0;
   while (Date.now() < deadline) {
     const receipt = await provider.send("eth_getTransactionReceipt", [hash]);
     if (receipt) return receipt;
+    if (Date.now() >= nextLivenessCheck) {
+      nextLivenessCheck = Date.now() + 1000;
+      try {
+        const [chainId, blockNumber] = await Promise.all([
+          provider.send("eth_chainId", []),
+          provider.send("eth_blockNumber", []),
+        ]);
+        console.error(`[diagnostic] ${label} rpc-live chainId=${chainId} block=${blockNumber} anvilExited=${anvilExited}`);
+      } catch (error) {
+        console.error(`[diagnostic] ${label} rpc-liveness-error=${error.message} anvilExited=${anvilExited}`);
+      }
+    }
     await sleep(250);
   }
   const [transaction, receipt, blockNumber] = await Promise.all([
@@ -176,13 +189,19 @@ async function main() {
   console.log("[stage] start adapter runtime harness");
   const A = compile();
   console.log(`[stage] start owned RPC on port ${ANVIL_PORT}`);
-  anvilProcess = spawn(anvil, ["--host", "127.0.0.1", "--port", String(ANVIL_PORT), "--chain-id", "31337", "--accounts", "2", "--balance", "1000", "--threads", "1", "--silent"], { stdio: ["ignore", "pipe", "pipe"] });
-  anvilProcess.stdout.on("data", (chunk) => anvilOutput.push(String(chunk)));
-  anvilProcess.stderr.on("data", (chunk) => anvilOutput.push(String(chunk)));
+  // Keep Anvil's stdio detached from the harness. A piped child stream can
+  // outlive/close independently on hosted runners and makes the RPC owner
+  // disappear without a useful error. We retain the child handle for explicit
+  // lifecycle diagnostics and cleanup below.
+  anvilProcess = spawn(anvil, ["--host", "127.0.0.1", "--port", String(ANVIL_PORT), "--chain-id", "31337", "--accounts", "2", "--balance", "1000", "--threads", "1", "--silent"], { stdio: "ignore", detached: true });
+  anvilProcess.unref();
   anvilProcess.once("error", (error) => console.error(`[stage] Anvil spawn error: ${error.message}`));
   anvilProcess.once("exit", (code, signal) => {
     anvilExited = true;
     console.error(`[stage] owned Anvil exited code=${code} signal=${signal}`);
+  });
+  anvilProcess.once("close", (code, signal) => {
+    console.error(`[stage] owned Anvil closed code=${code} signal=${signal}`);
   });
   await sleep(500);
   const provider = new JsonRpcProvider(`http://127.0.0.1:${ANVIL_PORT}`, 31337, { staticNetwork: true, batchMaxCount: 1 });
