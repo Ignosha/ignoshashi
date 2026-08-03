@@ -60,14 +60,16 @@ async function withTimeout(promise, label) {
   } finally { clearTimeout(timer); }
 }
 async function deploy(artifact, signer, ...args) {
-  const factory = new ContractFactory(artifact.abi, artifact.bytecode, signer);
-  const address = await signer.getAddress();
-  // Read both views immediately before every deployment. Never carry a locally
-  // reserved nonce across constructor-estimation reverts or receipt waits.
-  const latest = await activeProvider.getTransactionCount(address, "latest");
-  const pending = await activeProvider.getTransactionCount(address, "pending");
+  // Use a fresh provider and Wallet for every constructor. This avoids any
+  // JsonRpcProvider nonce/cache state surviving a constructor-estimation revert.
+  const deploymentProvider = new JsonRpcProvider(activeProvider._getConnection().url, 31337, { staticNetwork: true, batchMaxCount: 1 });
+  const deploymentSigner = new Wallet(signer.privateKey, deploymentProvider);
+  const factory = new ContractFactory(artifact.abi, artifact.bytecode, deploymentSigner);
+  const address = await deploymentSigner.getAddress();
+  const latest = await deploymentProvider.getTransactionCount(address, "latest");
+  const pending = await deploymentProvider.getTransactionCount(address, "pending");
   const nonce = pending;
-  const gas = await factory.getDeployTransaction(...args).then((tx) => signer.estimateGas(tx));
+  const gas = await factory.getDeployTransaction(...args).then((tx) => deploymentSigner.estimateGas(tx));
   const expected = getCreateAddress({ from: address, nonce });
   console.log(`[tx] deploy ${args[0] ?? "contract"} signer=${address} nonce.latest=${latest} nonce.pending=${pending} gas=${gas} expected=${expected}`);
   const contract = await withTimeout(factory.deploy(...args), `deploy ${args[0] ?? "contract"}`);
