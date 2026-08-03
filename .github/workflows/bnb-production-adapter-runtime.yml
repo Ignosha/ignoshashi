@@ -27,6 +27,8 @@ jobs:
       # runner's stable temporary directory instead of ${{ runner.temp }} here.
       ANVIL_LOG: /tmp/bnb-anvil.log
       ANVIL_PID: /tmp/bnb-anvil.pid
+      PANCAKE_ADAPTER_LOG: /tmp/pancake-adapter-runtime.log
+      PRODUCTION_HARNESS_LOG: /tmp/bnb-production-v1-harness.log
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -79,7 +81,11 @@ jobs:
         run: timeout --signal=TERM --kill-after=10s 120s node contracts/compile-pancake-adapter.js
 
       - name: Run production V1 harness
-        run: timeout --signal=TERM --kill-after=10s 120s node contracts/bnb-production-v1-harness.mjs
+        shell: bash
+        run: |
+          set -o pipefail
+          timeout --signal=TERM --kill-after=10s 120s \
+            node contracts/bnb-production-v1-harness.mjs 2>&1 | tee "$PRODUCTION_HARNESS_LOG"
 
       - name: Run BNB runtime mock tests
         run: timeout --signal=TERM --kill-after=10s 120s node contracts/bnb-runtime-mock-test.mjs
@@ -94,7 +100,11 @@ jobs:
           sudo ln -sf "$RUNNER_TEMP/bnb-runtime-bin/anvil" /home/team/shared/tools/anvil/anvil
 
       - name: Run Pancake adapter runtime tests
-        run: timeout --signal=TERM --kill-after=10s 180s node contracts/pancake-adapter-runtime-test.mjs
+        shell: bash
+        run: |
+          set -o pipefail
+          timeout --signal=TERM --kill-after=10s 180s \
+            node contracts/pancake-adapter-runtime-test.mjs 2>&1 | tee "$PANCAKE_ADAPTER_LOG"
 
       - name: Upload runtime logs and artifacts
         if: always()
@@ -105,6 +115,8 @@ jobs:
           retention-days: 14
           path: |
             ${{ runner.temp }}/bnb-anvil.log
+            /tmp/pancake-adapter-runtime.log
+            /tmp/bnb-production-v1-harness.log
             contracts/**/artifacts/**
             contracts/artifacts/**
             src/contracts/abis/**
