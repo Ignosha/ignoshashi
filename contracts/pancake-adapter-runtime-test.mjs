@@ -10,6 +10,7 @@ const dir = new URL(".", import.meta.url);
 const anvil = "/home/team/shared/tools/anvil/anvil";
 let anvilProcess;
 let activeProvider;
+const anvilOutput = [];
 
 async function unusedPort() {
   const server = createServer();
@@ -76,6 +77,21 @@ async function withTimeout(promise, label) {
     return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${TX_TIMEOUT_MS}ms`)), TX_TIMEOUT_MS); })]);
   } finally { clearTimeout(timer); }
 }
+async function waitForReceipt(provider, hash, label) {
+  const deadline = Date.now() + TX_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const receipt = await provider.send("eth_getTransactionReceipt", [hash]);
+    if (receipt) return receipt;
+    await sleep(250);
+  }
+  const [transaction, receipt, blockNumber] = await Promise.all([
+    provider.send("eth_getTransactionByHash", [hash]),
+    provider.send("eth_getTransactionReceipt", [hash]),
+    provider.send("eth_blockNumber", []),
+  ]);
+  console.error(`[diagnostic] ${label} hash=${hash} block=${blockNumber} tx=${JSON.stringify(transaction)} receipt=${JSON.stringify(receipt)} anvil=${anvilOutput.join("").slice(-4000)}`);
+  throw new Error(`${label} timed out after ${TX_TIMEOUT_MS}ms`);
+}
 async function deploy(artifact, signer, ...args) {
   const deploymentProvider = new JsonRpcProvider(activeProvider._getConnection().url, 31337, { staticNetwork: true, batchMaxCount: 1 });
   const deploymentSigner = new Wallet(signer.privateKey, deploymentProvider);
@@ -94,16 +110,16 @@ async function deploy(artifact, signer, ...args) {
   assert.equal(submittedDeploymentNonces.has(tx.nonce), false, `duplicate submitted deployment nonce ${tx.nonce}`);
   submittedDeploymentNonces.add(tx.nonce);
   console.log(`[tx] deploy ${args[0] ?? "contract"} hash=${tx.hash} nonce=${tx.nonce}`);
-  const receipt = await withTimeout(tx.wait(), `receipt deploy ${args[0] ?? "contract"}`);
+  const receipt = await waitForReceipt(deploymentProvider, tx.hash, `receipt deploy ${args[0] ?? "contract"}`);
   assert.ok(receipt, `deployment ${args[0] ?? "contract"} receipt must be available`);
-  assert.equal(receipt.status, 1, `deployment ${args[0] ?? "contract"} receipt must succeed`);
+  assert.equal(Number(receipt.status), 1, `deployment ${args[0] ?? "contract"} receipt must succeed`);
   console.log(`[tx] deployed ${args[0] ?? "contract"} address=${await contract.getAddress()} nonce=${nonce} receipt=${receipt.hash}`);
   return contract;
 }
 async function waitTx(txPromise, label) {
   const tx = await withTimeout(txPromise, `${label} submission`);
   console.log(`[tx] ${label} hash=${tx.hash} nonce=${tx.nonce} gas=${tx.gasLimit}`);
-  await withTimeout(activeProvider.waitForTransaction(tx.hash, 1, TX_TIMEOUT_MS), `${label} receipt`);
+  await waitForReceipt(activeProvider, tx.hash, `${label} receipt`);
 }
 async function expectRevert(action, text) {
   try {
@@ -129,7 +145,9 @@ async function main() {
   const A = compile();
   console.log("[stage] select isolated ephemeral RPC port");
   const port = await unusedPort();
-  anvilProcess = spawn(anvil, ["--host", "127.0.0.1", "--port", String(port), "--chain-id", "31337", "--accounts", "2", "--balance", "1000", "--threads", "1", "--silent"], { stdio: "ignore" });
+  anvilProcess = spawn(anvil, ["--host", "127.0.0.1", "--port", String(port), "--chain-id", "31337", "--accounts", "2", "--balance", "1000", "--threads", "1", "--silent"], { stdio: ["ignore", "pipe", "pipe"] });
+  anvilProcess.stdout.on("data", (chunk) => anvilOutput.push(String(chunk)));
+  anvilProcess.stderr.on("data", (chunk) => anvilOutput.push(String(chunk)));
   anvilProcess.once("error", (error) => console.error(`[stage] Anvil spawn error: ${error.message}`));
   anvilProcess.once("exit", (code, signal) => { if (code !== 0 && signal !== "SIGTERM") console.error(`[stage] owned Anvil exited code=${code} signal=${signal}`); });
   await sleep(500);
