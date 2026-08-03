@@ -54,22 +54,28 @@ function compile() {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const TX_TIMEOUT_MS = 15_000;
-// All constructor attempts use one allocator. In particular, a constructor
-// whose gas estimation reverts must not cause the next constructor to
-// rediscover and reuse the provider's pending nonce.
-let deploymentNonce;
-const submittedDeploymentNonces = new Set();
-async function nextDeploymentNonce(provider, address) {
-  if (deploymentNonce === undefined) {
+// Every state-changing transaction uses this single allocator and provider.
+// Estimation-only reverts rewind the reservation because no transaction was
+// submitted; submitted nonces are never reused or skipped.
+let transactionNonce;
+const submittedTransactionNonces = new Set();
+async function nextTransactionNonce(provider, address) {
+  if (transactionNonce === undefined) {
     const latest = await provider.getTransactionCount(address, "latest");
     const pending = await provider.getTransactionCount(address, "pending");
-    deploymentNonce = pending > latest ? pending : latest;
-    console.log(`[nonce] initialized deployment allocator latest=${latest} pending=${pending} next=${deploymentNonce}`);
+    transactionNonce = pending > latest ? pending : latest;
+    console.log(`[nonce] initialized allocator latest=${latest} pending=${pending} next=${transactionNonce}`);
   }
-  const nonce = deploymentNonce;
-  deploymentNonce += 1;
-  console.log(`[nonce] reserved deployment nonce=${nonce} next=${deploymentNonce}`);
+  const nonce = transactionNonce;
+  transactionNonce += 1;
+  console.log(`[nonce] reserved nonce=${nonce} next=${transactionNonce}`);
   return nonce;
+}
+function recordSubmitted(tx, label) {
+  assert.equal(tx.nonce, transactionNonce - 1, `${label} nonce must follow allocator`);
+  assert.equal(submittedTransactionNonces.has(tx.nonce), false, `duplicate submitted nonce ${tx.nonce} for ${label}`);
+  submittedTransactionNonces.add(tx.nonce);
+  console.log(`[nonce] submitted label=${label} nonce=${tx.nonce} unique=${submittedTransactionNonces.size}`);
 }
 async function withTimeout(promise, label) {
   let timer;
@@ -93,19 +99,17 @@ async function waitForReceipt(provider, hash, label) {
   throw new Error(`${label} timed out after ${TX_TIMEOUT_MS}ms`);
 }
 async function deploy(artifact, signer, ...args) {
-  const deploymentProvider = new JsonRpcProvider(activeProvider._getConnection().url, 31337, { staticNetwork: true, batchMaxCount: 1 });
-  const deploymentSigner = new Wallet(signer.privateKey, deploymentProvider);
-  const factory = new ContractFactory(artifact.abi, artifact.bytecode, deploymentSigner);
-  const address = await deploymentSigner.getAddress();
+  const factory = new ContractFactory(artifact.abi, artifact.bytecode, signer);
+  const address = await signer.getAddress();
   // Reserve before estimation so an expected constructor revert cannot reset
-  // the nonce boundary for the following deployment.
-  const nonce = await nextDeploymentNonce(deploymentProvider, address);
+  // the nonce boundary for the following transaction.
+  const nonce = await nextTransactionNonce(activeProvider, address);
   let gas;
   try {
-    gas = await factory.getDeployTransaction(...args).then((tx) => deploymentSigner.estimateGas({ ...tx, nonce }));
+    gas = await factory.getDeployTransaction(...args).then((tx) => signer.estimateGas({ ...tx, nonce }));
   } catch (error) {
     // Estimation-only constructor reverts do not consume a nonce.
-    deploymentNonce = nonce;
+    transactionNonce = nonce;
     throw error;
   }
   const expected = getCreateAddress({ from: address, nonce });
@@ -114,36 +118,60 @@ async function deploy(artifact, signer, ...args) {
   const tx = contract.deploymentTransaction();
   assert.ok(tx, `deployment ${args[0] ?? "contract"} must expose a transaction`);
   assert.equal(tx.nonce, nonce, `deployment nonce mismatch for ${args[0] ?? "contract"}`);
-  assert.equal(submittedDeploymentNonces.has(tx.nonce), false, `duplicate submitted deployment nonce ${tx.nonce}`);
-  submittedDeploymentNonces.add(tx.nonce);
+  recordSubmitted(tx, `deploy ${args[0] ?? "contract"}`);
   console.log(`[tx] deploy ${args[0] ?? "contract"} hash=${tx.hash} nonce=${tx.nonce}`);
-  const receipt = await waitForReceipt(deploymentProvider, tx.hash, `receipt deploy ${args[0] ?? "contract"}`);
+  const receipt = await waitForReceipt(activeProvider, tx.hash, `receipt deploy ${args[0] ?? "contract"}`);
   assert.ok(receipt, `deployment ${args[0] ?? "contract"} receipt must be available`);
   assert.equal(Number(receipt.status), 1, `deployment ${args[0] ?? "contract"} receipt must succeed`);
   console.log(`[tx] deployed ${args[0] ?? "contract"} address=${await contract.getAddress()} nonce=${nonce} receipt=${receipt.hash}`);
   return contract;
 }
-async function waitTx(txPromise, label) {
-  const tx = await withTimeout(txPromise, `${label} submission`);
+async function waitTx(action, label) {
+  const nonce = await nextTransactionNonce(activeProvider, await signerAddressFor(activeProvider));
+  let tx;
+  try {
+    tx = await withTimeout(action(nonce), `${label} submission`);
+  } catch (error) {
+    // A failed estimate did not submit, so make the nonce available again.
+    transactionNonce = nonce;
+    throw error;
+  }
+  assert.equal(tx.nonce, nonce, `${label} nonce mismatch`);
+  recordSubmitted(tx, label);
   console.log(`[tx] ${label} hash=${tx.hash} nonce=${tx.nonce} gas=${tx.gasLimit}`);
   await waitForReceipt(activeProvider, tx.hash, `${label} receipt`);
 }
+let sharedSignerAddress;
+async function signerAddressFor() {
+  assert.ok(sharedSignerAddress, "shared signer address must be initialized");
+  return sharedSignerAddress;
+}
 async function expectRevert(action, text) {
+  let nonce;
   try {
-    const result = await action();
+    nonce = await nextTransactionNonce(activeProvider, sharedSignerAddress);
+    const result = await action(nonce);
     // Some revert paths are only detected when the submitted transaction is mined;
-    // always drain that receipt so NonceManager cannot leave a gap for later cases.
+    // always drain that receipt so later helpers cannot leave a nonce gap.
     if (result && typeof result.wait === "function") {
       const tx = result;
+      assert.equal(tx.nonce, nonce, `expected revert ${text} nonce mismatch`);
+      recordSubmitted(tx, `expected revert ${text}`);
       console.log(`[tx] expected revert ${text} hash=${tx.hash} nonce=${tx.nonce} gas=${tx.gasLimit}`);
-      await withTimeout(tx.wait(), `expected revert ${text} receipt`);
+      await waitForReceipt(activeProvider, tx.hash, `expected revert ${text} receipt`);
     }
     assert.fail(`expected ${text}`);
   } catch (error) {
     if (String(error.message).startsWith("expected ")) throw error;
     const details = String(error.shortMessage ?? error.message);
     // Constructor custom errors may be surfaced by eth_estimateGas without a decoded name.
-    if (text === "INVALID_CONFIGURATION" && details === "execution reverted (unknown custom error)") return;
+    if (text === "INVALID_CONFIGURATION" && details === "execution reverted (unknown custom error)") {
+      transactionNonce = nonce;
+      return;
+    }
+    if (details.includes("execution reverted") && !details.match(new RegExp(text))) {
+      transactionNonce = nonce;
+    }
     assert.match(details, new RegExp(text));
   }
 }
@@ -167,6 +195,7 @@ async function main() {
   const timelock = new Wallet("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d", provider);
   assert.equal((await provider.getNetwork()).chainId, 31337n);
   const signerAddress = await signer.getAddress();
+  sharedSignerAddress = signerAddress;
   assert.ok((await provider.getBalance(signerAddress)) >= 1000n * 10n ** 18n, "fresh Anvil signer must be funded");
 
   console.log("[stage] deploy mocks and adapter cases");
@@ -177,51 +206,51 @@ async function main() {
   const wrongWbnb = await deploy(A.token, signer, "WRONG_WBNB");
   const mismatchedRouter = await deploy(A.router, signer, await factory.getAddress(), await wrongWbnb.getAddress());
     await expectRevert(
-    async () => deploy(A.adapter, signer, await factory.getAddress(), await mismatchedRouter.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress()),
+    async (nonce) => { transactionNonce = nonce; return deploy(A.adapter, signer, await factory.getAddress(), await mismatchedRouter.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress()); },
     "INVALID_CONFIGURATION",
   );
   // The plain wallet has no local nonce reservation to reset after estimation.
   const adapter = await deploy(A.adapter, signer, await factory.getAddress(), await router.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
   const token = await deploy(A.token, signer, "TOKEN");
-  await waitTx(registry.set(signerAddress, await token.getAddress(), true), "registry.set");
+  await waitTx(async (nonce) => registry.set(signerAddress, await token.getAddress(), true, { nonce }), "registry.set");
   const base = [100, 1, 99, 1, 9999999999, 1, timelock.address];
 
-  await expectRevert(async () => adapter.graduate(await token.getAddress(), base, { value: 1 }), "allowance");
-  await waitTx(token.approve(await adapter.getAddress(), 100), "token.approve adapter");
-  await waitTx(token.mint(signer.address, 1000), "token.mint");
-  await expectRevert(async () => adapter.graduate(await token.getAddress(), [...base.slice(0, 6), signer.address], { value: 1 }), "WrongTimelock");
-  await expectRevert(async () => adapter.graduate(await token.getAddress(), base, { value: 2 }), "NativeAmountMismatch");
-  await expectRevert(async () => adapter.graduate(await token.getAddress(), [100, 1, 101, 1, ...base.slice(4)], { value: 1 }), "InvalidParams");
-  await expectRevert(async () => adapter.graduate(await token.getAddress(), [100, 1, 99, 1, 1, ...base.slice(5)], { value: 1 }), "InvalidParams");
+  await expectRevert(async (nonce) => adapter.graduate(await token.getAddress(), base, { value: 1, nonce }), "allowance");
+  await waitTx(async (nonce) => token.approve(await adapter.getAddress(), 100, { nonce }), "token.approve adapter");
+  await waitTx(async (nonce) => token.mint(signer.address, 1000, { nonce }), "token.mint");
+  await expectRevert(async (nonce) => adapter.graduate(await token.getAddress(), [...base.slice(0, 6), signer.address], { value: 1, nonce }), "WrongTimelock");
+  await expectRevert(async (nonce) => adapter.graduate(await token.getAddress(), base, { value: 2, nonce }), "NativeAmountMismatch");
+  await expectRevert(async (nonce) => adapter.graduate(await token.getAddress(), [100, 1, 101, 1, ...base.slice(4)], { value: 1, nonce }), "InvalidParams");
+  await expectRevert(async (nonce) => adapter.graduate(await token.getAddress(), [100, 1, 99, 1, 1, ...base.slice(5)], { value: 1, nonce }), "InvalidParams");
 
   const wrongPair = await deploy(A.pair, signer, await wbnb.getAddress(), timelock.address);
-  await waitTx(factory.setPair(await wrongPair.getAddress()), "factory.setPair wrong");
-  await expectRevert(async () => adapter.graduate(await token.getAddress(), base, { value: 1 }), "WrongPair");
+  await waitTx(async (nonce) => factory.setPair(await wrongPair.getAddress(), { nonce }), "factory.setPair wrong");
+  await expectRevert(async (nonce) => adapter.graduate(await token.getAddress(), base, { value: 1, nonce }), "WrongPair");
 
   const factory2 = await deploy(A.factory, signer);
   const router2 = await deploy(A.router, signer, await factory2.getAddress(), await wbnb.getAddress());
   const adapter2 = await deploy(A.adapter, signer, await factory2.getAddress(), await router2.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
-  await waitTx(router2.setLiquidity(0), "router2.setLiquidity");
-  await waitTx(token.approve(await adapter2.getAddress(), 100), "token.approve adapter2");
-  await expectRevert(async () => adapter2.graduate(await token.getAddress(), base, { value: 1 }), "ZeroLiquidity");
+  await waitTx(async (nonce) => router2.setLiquidity(0, { nonce }), "router2.setLiquidity");
+  await waitTx(async (nonce) => token.approve(await adapter2.getAddress(), 100, { nonce }), "token.approve adapter2");
+  await expectRevert(async (nonce) => adapter2.graduate(await token.getAddress(), base, { value: 1, nonce }), "ZeroLiquidity");
 
   const factory3 = await deploy(A.factory, signer);
   const router3 = await deploy(A.router, signer, await factory3.getAddress(), await wbnb.getAddress());
   const adapter3 = await deploy(A.adapter, signer, await factory3.getAddress(), await router3.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
-  await waitTx(token.approve(await adapter3.getAddress(), 100), "token.approve adapter3");
-  await waitTx(adapter3.graduate(await token.getAddress(), base, { value: 1 }), "adapter3.graduate");
+  await waitTx(async (nonce) => token.approve(await adapter3.getAddress(), 100, { nonce }), "token.approve adapter3");
+  await waitTx(async (nonce) => adapter3.graduate(await token.getAddress(), base, { value: 1, nonce }), "adapter3.graduate");
   const pairAddress = await factory3.getPair(await token.getAddress(), await wbnb.getAddress());
   const pair = new Contract(pairAddress, A.pair.abi, provider);
   assert.equal(await pair.balanceOf(timelock.address), 1n);
   assert.equal(await token.allowance(await adapter3.getAddress(), await router3.getAddress()), 0n);
   assert.equal(await adapter3.isVerifiedPool(await token.getAddress(), pairAddress), true);
-  await expectRevert(async () => adapter3.graduate(await token.getAddress(), base, { value: 1 }), "Replay");
+  await expectRevert(async (nonce) => adapter3.graduate(await token.getAddress(), base, { value: 1, nonce }), "Replay");
 
   const router4 = await deploy(A.router, signer, await factory3.getAddress(), await wbnb.getAddress());
   const adapter4 = await deploy(A.adapter, signer, await factory3.getAddress(), await router4.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
-  await waitTx(router4.setActualToken(99, true), "router4.setActualToken");
-  await waitTx(token.approve(await adapter4.getAddress(), 100), "token.approve adapter4");
-  await expectRevert(async () => adapter4.graduate(await token.getAddress(), base, { value: 1 }), "Slippage");
+  await waitTx(async (nonce) => router4.setActualToken(99, true, { nonce }), "router4.setActualToken");
+  await waitTx(async (nonce) => token.approve(await adapter4.getAddress(), 100, { nonce }), "token.approve adapter4");
+  await expectRevert(async (nonce) => adapter4.graduate(await token.getAddress(), base, { value: 1, nonce }), "Slippage");
 
   console.log("[stage] assertions complete");
   console.log("PASS adapter runtime: constructor configuration, authorization, timelock/amount/parameter checks, pair validation, zero liquidity, LP custody, allowance reset, replay, and slippage rollback");
