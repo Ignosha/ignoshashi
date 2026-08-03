@@ -53,6 +53,7 @@ const TX_TIMEOUT_MS = 15_000;
 // Estimation-only reverts rewind the reservation because no transaction was
 // submitted; submitted nonces are never reused or skipped.
 let transactionNonce;
+let lastSubmittedTransactionNonce;
 const submittedTransactionNonces = new Set();
 async function nextTransactionNonce(provider, address) {
   if (transactionNonce === undefined) {
@@ -69,8 +70,22 @@ async function nextTransactionNonce(provider, address) {
 function recordSubmitted(tx, label) {
   assert.equal(tx.nonce, transactionNonce - 1, `${label} nonce must follow allocator`);
   assert.equal(submittedTransactionNonces.has(tx.nonce), false, `duplicate submitted nonce ${tx.nonce} for ${label}`);
+  if (lastSubmittedTransactionNonce !== undefined) {
+    assert.equal(tx.nonce, lastSubmittedTransactionNonce + 1, `${label} nonce gap after ${lastSubmittedTransactionNonce}`);
+  }
   submittedTransactionNonces.add(tx.nonce);
-  console.log(`[nonce] submitted label=${label} nonce=${tx.nonce} unique=${submittedTransactionNonces.size}`);
+  lastSubmittedTransactionNonce = tx.nonce;
+  console.log(`[nonce] submitted label=${label} nonce=${tx.nonce} unique=${submittedTransactionNonces.size} contiguous=true`);
+}
+function assertMinedReceipt(receipt, label) {
+  assert.ok(receipt, `${label} receipt must be available before next nonce`);
+  assert.equal(Number(receipt.status), 1, `${label} receipt must succeed`);
+  console.log(`[tx] mined label=${label} receipt=${receipt.transactionHash ?? receipt.hash} block=${receipt.blockNumber} txIndex=${receipt.transactionIndex}`);
+}
+function assertRevertedReceipt(receipt, label) {
+  assert.ok(receipt, `${label} receipt must be available before next nonce`);
+  assert.equal(Number(receipt.status), 0, `${label} receipt must revert`);
+  console.log(`[tx] mined label=${label} receipt=${receipt.transactionHash} block=${receipt.blockNumber} status=${receipt.status}`);
 }
 async function withTimeout(promise, label) {
   let timer;
@@ -131,8 +146,7 @@ async function deploy(artifact, signer, ...args) {
   recordSubmitted(tx, `deploy ${args[0] ?? "contract"}`);
   console.log(`[tx] deploy ${args[0] ?? "contract"} hash=${tx.hash} nonce=${tx.nonce}`);
   const receipt = await waitForReceipt(activeProvider, tx.hash, `receipt deploy ${args[0] ?? "contract"}`);
-  assert.ok(receipt, `deployment ${args[0] ?? "contract"} receipt must be available`);
-  assert.equal(Number(receipt.status), 1, `deployment ${args[0] ?? "contract"} receipt must succeed`);
+  assertMinedReceipt(receipt, `deploy ${args[0] ?? "contract"}`);
   console.log(`[tx] deployed ${args[0] ?? "contract"} address=${await contract.getAddress()} nonce=${nonce} receipt=${receipt.hash}`);
   return contract;
 }
@@ -149,12 +163,24 @@ async function waitTx(action, label) {
   assert.equal(tx.nonce, nonce, `${label} nonce mismatch`);
   recordSubmitted(tx, label);
   console.log(`[tx] ${label} hash=${tx.hash} nonce=${tx.nonce} gas=${tx.gasLimit}`);
-  await waitForReceipt(activeProvider, tx.hash, `${label} receipt`);
+  const receipt = await waitForReceipt(activeProvider, tx.hash, `${label} receipt`);
+  assertMinedReceipt(receipt, label);
 }
 let sharedSignerAddress;
 async function signerAddressFor() {
   assert.ok(sharedSignerAddress, "shared signer address must be initialized");
   return sharedSignerAddress;
+}
+async function expectConstructorRevert(action, text) {
+  try {
+    await action();
+    assert.fail(`expected ${text}`);
+  } catch (error) {
+    if (String(error.message).startsWith("expected ")) throw error;
+    const details = String(error.shortMessage ?? error.message);
+    if (text === "INVALID_CONFIGURATION" && details === "execution reverted (unknown custom error)") return;
+    assert.match(details, new RegExp(text));
+  }
 }
 async function expectRevert(action, text) {
   let nonce;
@@ -168,7 +194,8 @@ async function expectRevert(action, text) {
       assert.equal(tx.nonce, nonce, `expected revert ${text} nonce mismatch`);
       recordSubmitted(tx, `expected revert ${text}`);
       console.log(`[tx] expected revert ${text} hash=${tx.hash} nonce=${tx.nonce} gas=${tx.gasLimit}`);
-      await waitForReceipt(activeProvider, tx.hash, `expected revert ${text} receipt`);
+      const receipt = await waitForReceipt(activeProvider, tx.hash, `expected revert ${text} receipt`);
+      assertRevertedReceipt(receipt, `expected revert ${text}`);
     }
     assert.fail(`expected ${text}`);
   } catch (error) {
@@ -223,8 +250,8 @@ async function main() {
   const router = await deploy(A.router, signer, await factory.getAddress(), await wbnb.getAddress());
   const wrongWbnb = await deploy(A.token, signer, "WRONG_WBNB");
   const mismatchedRouter = await deploy(A.router, signer, await factory.getAddress(), await wrongWbnb.getAddress());
-    await expectRevert(
-    async (nonce) => { transactionNonce = nonce; return deploy(A.adapter, signer, await factory.getAddress(), await mismatchedRouter.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress()); },
+    await expectConstructorRevert(
+    async () => new ContractFactory(A.adapter.abi, A.adapter.bytecode, signer).getDeployTransaction(await factory.getAddress(), await mismatchedRouter.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress()).then((tx) => signer.estimateGas(tx)),
     "INVALID_CONFIGURATION",
   );
   // The plain wallet has no local nonce reservation to reset after estimation.
