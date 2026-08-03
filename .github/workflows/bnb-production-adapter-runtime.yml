@@ -82,6 +82,15 @@ jobs:
       - name: Run BNB runtime mock tests
         run: timeout --signal=TERM --kill-after=10s 120s node contracts/bnb-runtime-mock-test.mjs
 
+      - name: Make Anvil available to the self-contained harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bnb-runtime-bin"
+          ln -sf "$(command -v anvil)" "$RUNNER_TEMP/bnb-runtime-bin/anvil"
+          sudo mkdir -p /home/team/shared/tools/anvil
+          sudo ln -sf "$RUNNER_TEMP/bnb-runtime-bin/anvil" /home/team/shared/tools/anvil/anvil
+
       - name: Run Pancake adapter runtime tests
         run: timeout --signal=TERM --kill-after=10s 180s node contracts/pancake-adapter-runtime-test.mjs
 
@@ -112,3 +121,4 @@ jobs:
             kill -KILL "$(cat "$ANVIL_PID")" 2>/dev/null || true
           fi
           test ! -f "$ANVIL_LOG" || cat "$ANVIL_LOG"
+/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
