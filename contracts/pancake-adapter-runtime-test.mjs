@@ -188,18 +188,22 @@ async function expectConstructorRevert(action, text) {
 let customErrorSelectors = new Map();
 function findRevertData(error) {
   const seen = new Set();
+  const found = [];
   const visit = (value) => {
-    if (value == null || typeof value === "function") return undefined;
-    if (typeof value === "string") return value.match(/0x[0-9a-fA-F]{8,}/)?.[0];
-    if (typeof value !== "object" || seen.has(value)) return undefined;
-    seen.add(value);
-    for (const key of ["data", "error", "info", "cause", "value", "response"]) {
-      const found = visit(value[key]);
-      if (found) return found;
+    if (value == null || typeof value === "function") return;
+    if (typeof value === "string") {
+      const match = value.match(/^0x[0-9a-fA-F]{8,}$/);
+      if (match) found.push(match[0].slice(0, 10).toLowerCase());
+      return;
     }
-    return undefined;
+    if (typeof value !== "object" || seen.has(value)) return;
+    seen.add(value);
+    // Provider error payloads are nested differently across ethers/RPC clients.
+    // Visit revert-specific wrappers before generic data (which can be calldata).
+    for (const key of ["error", "info", "cause", "value", "response", "data"]) visit(value[key]);
   };
-  return visit(error);
+  visit(error);
+  return found;
 }
 async function expectRevert(action, text) {
   let nonce;
@@ -228,7 +232,7 @@ async function expectRevert(action, text) {
     // such error, not only errors whose text happens to include "execution reverted".
     // This keeps the next ordinary transaction on the reserved nonce.
     if (!submitted) transactionNonce = nonce;
-    if (expectedSelector && revertData?.slice(0, 10).toLowerCase() === expectedSelector) return;
+    if (expectedSelector && revertData.includes(expectedSelector)) return;
     assert.match(details, new RegExp(text));
   }
 }
