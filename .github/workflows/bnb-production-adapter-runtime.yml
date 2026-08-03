@@ -1,0 +1,114 @@
+name: BNB production adapter runtime
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'contracts/**'
+      - 'docs/bnb-production-adapter-runtime.md'
+      - '.github/workflows/bnb-production-adapter-runtime.yml'
+  push:
+    paths:
+      - 'contracts/**'
+      - 'docs/bnb-production-adapter-runtime.md'
+      - '.github/workflows/bnb-production-adapter-runtime.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: Compile and exercise BNB production adapters
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ANVIL_PORT: '8545'
+      ANVIL_LOG: ${{ runner.temp }}/bnb-anvil.log
+      ANVIL_PID: ${{ runner.temp }}/bnb-anvil.pid
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Keep the runner install small: the harnesses only need the pinned EVM
+      # tooling already declared by this repository, not the web app bundle.
+      - name: Install pinned harness tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/bnb-runtime-deps" \
+            --no-package-lock --ignore-scripts --no-audit --no-fund \
+            ethers@6 solc@0.8.36
+          ln -s "$RUNNER_TEMP/bnb-runtime-deps/node_modules" node_modules
+
+      - name: Install Anvil
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Start isolated Anvil
+        shell: bash
+        run: |
+          set -euo pipefail
+          anvil --host 127.0.0.1 --port "$ANVIL_PORT" --chain-id 31337 \
+            --accounts 10 --balance 10000 --silent >"$ANVIL_LOG" 2>&1 &
+          echo "$!" >"$ANVIL_PID"
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error \
+              -H 'content-type: application/json' \
+              --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
+              "http://127.0.0.1:${ANVIL_PORT}" | grep -q '0x7a69'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$ANVIL_LOG"
+          echo 'Anvil did not become ready' >&2
+          exit 1
+
+      - name: Compile BNB production contract
+        run: timeout --signal=TERM --kill-after=10s 120s node contracts/compile-bnb-production.js
+
+      - name: Compile Pancake adapter contracts
+        run: timeout --signal=TERM --kill-after=10s 120s node contracts/compile-pancake-adapter.js
+
+      - name: Run production V1 harness
+        run: timeout --signal=TERM --kill-after=10s 120s node contracts/bnb-production-v1-harness.mjs
+
+      - name: Run BNB runtime mock tests
+        run: timeout --signal=TERM --kill-after=10s 120s node contracts/bnb-runtime-mock-test.mjs
+
+      - name: Run Pancake adapter runtime tests
+        run: timeout --signal=TERM --kill-after=10s 180s node contracts/pancake-adapter-runtime-test.mjs
+
+      - name: Upload runtime logs and artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bnb-production-adapter-runtime-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/bnb-anvil.log
+            contracts/**/artifacts/**
+            contracts/artifacts/**
+            src/contracts/abis/**
+
+      - name: Stop owned Anvil process
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -f "$ANVIL_PID" ]; then
+            kill "$(cat "$ANVIL_PID")" 2>/dev/null || true
+            for attempt in {1..10}; do
+              kill -0 "$(cat "$ANVIL_PID")" 2>/dev/null || break
+              sleep 1
+            done
+            kill -KILL "$(cat "$ANVIL_PID")" 2>/dev/null || true
+          fi
+          test ! -f "$ANVIL_LOG" || cat "$ANVIL_LOG"
