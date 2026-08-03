@@ -224,11 +224,11 @@ async function expectRevert(action, text) {
     const details = String(error.shortMessage ?? error.message);
     const expectedSelector = customErrorSelectors.get(text);
     const revertData = findRevertData(error);
-    if (expectedSelector && revertData?.slice(0, 10).toLowerCase() === expectedSelector) return;
     // An estimation-only revert never submits a transaction. Rewind for every
     // such error, not only errors whose text happens to include "execution reverted".
     // This keeps the next ordinary transaction on the reserved nonce.
     if (!submitted) transactionNonce = nonce;
+    if (expectedSelector && revertData?.slice(0, 10).toLowerCase() === expectedSelector) return;
     assert.match(details, new RegExp(text));
   }
 }
