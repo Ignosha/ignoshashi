@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { readFileSync } from "node:fs";
 import solc from "solc";
-import { Contract, ContractFactory, JsonRpcProvider, NonceManager, Wallet, getCreateAddress } from "ethers";
+import { Contract, ContractFactory, JsonRpcProvider, Wallet, getCreateAddress } from "ethers";
 
 const dir = new URL(".", import.meta.url);
 const anvil = "/home/team/shared/tools/anvil/anvil";
@@ -61,10 +61,15 @@ async function withTimeout(promise, label) {
 }
 async function deploy(artifact, signer, ...args) {
   const factory = new ContractFactory(artifact.abi, artifact.bytecode, signer);
-  const nonce = await signer.getNonce("pending");
+  const address = await signer.getAddress();
+  // Read both views immediately before every deployment. Never carry a locally
+  // reserved nonce across constructor-estimation reverts or receipt waits.
+  const latest = await activeProvider.getTransactionCount(address, "latest");
+  const pending = await activeProvider.getTransactionCount(address, "pending");
+  const nonce = pending;
   const gas = await factory.getDeployTransaction(...args).then((tx) => signer.estimateGas(tx));
-  const expected = getCreateAddress({ from: await signer.getAddress(), nonce });
-  console.log(`[tx] deploy ${args[0] ?? "contract"} nonce=${nonce} gas=${gas} expected=${expected}`);
+  const expected = getCreateAddress({ from: address, nonce });
+  console.log(`[tx] deploy ${args[0] ?? "contract"} signer=${address} nonce.latest=${latest} nonce.pending=${pending} gas=${gas} expected=${expected}`);
   const contract = await withTimeout(factory.deploy(...args), `deploy ${args[0] ?? "contract"}`);
   const tx = contract.deploymentTransaction();
   console.log(`[tx] deploy ${args[0] ?? "contract"} hash=${tx?.hash ?? "unknown"}`);
@@ -108,13 +113,12 @@ async function main() {
   const provider = new JsonRpcProvider(`http://127.0.0.1:${port}`, 31337, { staticNetwork: true, batchMaxCount: 1 });
   activeProvider = provider;
   await waitForRpc(provider);
-  const signerWallet = new Wallet("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", provider);
-  // A plain Wallet lets ethers/provider reconcile pending nonces after constructor reverts;
-  // NonceManager can retain a local gap when an expected-revert deployment is mined.
-  const signer = new NonceManager(signerWallet);
+  // Use a plain Wallet: provider nonce state is authoritative after constructor
+  // estimation reverts, and each deployment reads it afresh.
+  const signer = new Wallet("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", provider);
   const timelock = new Wallet("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d", provider);
   assert.equal((await provider.getNetwork()).chainId, 31337n);
-  const signerAddress = await signerWallet.getAddress();
+  const signerAddress = await signer.getAddress();
   assert.ok((await provider.getBalance(signerAddress)) >= 1000n * 10n ** 18n, "fresh Anvil signer must be funded");
 
   console.log("[stage] deploy mocks and adapter cases");
@@ -128,9 +132,7 @@ async function main() {
     async () => deploy(A.adapter, signer, await factory.getAddress(), await mismatchedRouter.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress()),
     "INVALID_CONFIGURATION",
   );
-  // ContractFactory/NonceManager reserves a nonce before constructor estimation; an
-  // estimate-only revert leaves that local reservation unused and stalls the next tx.
-  signer.reset();
+  // The plain wallet has no local nonce reservation to reset after estimation.
   const adapter = await deploy(A.adapter, signer, await factory.getAddress(), await router.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
   const token = await deploy(A.token, signer, "TOKEN");
   await waitTx(registry.set(signerAddress, await token.getAddress(), true), "registry.set");
