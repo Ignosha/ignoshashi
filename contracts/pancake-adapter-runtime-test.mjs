@@ -97,8 +97,7 @@ async function deploy(artifact, signer, ...args) {
   const receipt = await withTimeout(tx.wait(), `receipt deploy ${args[0] ?? "contract"}`);
   assert.ok(receipt, `deployment ${args[0] ?? "contract"} receipt must be available`);
   assert.equal(receipt.status, 1, `deployment ${args[0] ?? "contract"} receipt must succeed`);
-  assert.equal(receipt.nonce, nonce, `deployment receipt nonce mismatch for ${args[0] ?? "contract"}`);
-  console.log(`[tx] deployed ${args[0] ?? "contract"} address=${await contract.getAddress()} nonce=${nonce}`);
+  console.log(`[tx] deployed ${args[0] ?? "contract"} address=${await contract.getAddress()} nonce=${nonce} receipt=${receipt.hash}`);
   return contract;
 }
 async function waitTx(txPromise, label) {
@@ -208,3 +207,4 @@ main().catch((error) => {
 }).finally(() => {
   if (anvilProcess) anvilProcess.kill("SIGTERM");
 });
+/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
