@@ -150,8 +150,11 @@ async function deploy(artifact, signer, ...args) {
   console.log(`[tx] deployed ${args[0] ?? "contract"} address=${await contract.getAddress()} nonce=${nonce} receipt=${receipt.hash}`);
   return contract;
 }
-async function waitTx(action, label) {
+async function waitTx(action, label, expectedNonce) {
   const nonce = await nextTransactionNonce(activeProvider, await signerAddressFor(activeProvider));
+  if (expectedNonce !== undefined) {
+    assert.equal(nonce, expectedNonce, `${label} must use the expected next nonce`);
+  }
   let tx;
   try {
     tx = await withTimeout(action(nonce), `${label} submission`);
@@ -184,6 +187,7 @@ async function expectConstructorRevert(action, text) {
 }
 async function expectRevert(action, text) {
   let nonce;
+  let submitted = false;
   try {
     nonce = await nextTransactionNonce(activeProvider, sharedSignerAddress);
     const result = await action(nonce);
@@ -192,6 +196,7 @@ async function expectRevert(action, text) {
     if (result && typeof result.wait === "function") {
       const tx = result;
       assert.equal(tx.nonce, nonce, `expected revert ${text} nonce mismatch`);
+      submitted = true;
       recordSubmitted(tx, `expected revert ${text}`);
       console.log(`[tx] expected revert ${text} hash=${tx.hash} nonce=${tx.nonce} gas=${tx.gasLimit}`);
       const receipt = await waitForReceipt(activeProvider, tx.hash, `expected revert ${text} receipt`);
@@ -201,14 +206,10 @@ async function expectRevert(action, text) {
   } catch (error) {
     if (String(error.message).startsWith("expected ")) throw error;
     const details = String(error.shortMessage ?? error.message);
-    // Constructor custom errors may be surfaced by eth_estimateGas without a decoded name.
-    if (text === "INVALID_CONFIGURATION" && details === "execution reverted (unknown custom error)") {
-      transactionNonce = nonce;
-      return;
-    }
-    if (details.includes("execution reverted") && !details.match(new RegExp(text))) {
-      transactionNonce = nonce;
-    }
+    // An estimation-only revert never submits a transaction. Rewind for every
+    // such error, not only errors whose text happens to include "execution reverted".
+    // This keeps the next ordinary transaction on the reserved nonce.
+    if (!submitted) transactionNonce = nonce;
     assert.match(details, new RegExp(text));
   }
 }
@@ -261,7 +262,10 @@ async function main() {
   const base = [100, 1, 99, 1, 9999999999, 1, timelock.address];
 
   await expectRevert(async (nonce) => adapter.graduate(await token.getAddress(), base, { value: 1, nonce }), "allowance");
-  await waitTx(async (nonce) => token.approve(await adapter.getAddress(), 100, { nonce }), "token.approve adapter");
+  // The preceding allowance check is estimate-only and must rewind its
+  // reservation; the first ordinary transaction after registry.set (nonce 8)
+  // therefore must reserve nonce 9 exactly once.
+  await waitTx(async (nonce) => token.approve(await adapter.getAddress(), 100, { nonce }), "token.approve adapter", 9);
   await waitTx(async (nonce) => token.mint(signer.address, 1000, { nonce }), "token.mint");
   await expectRevert(async (nonce) => adapter.graduate(await token.getAddress(), [...base.slice(0, 6), signer.address], { value: 1, nonce }), "WrongTimelock");
   await expectRevert(async (nonce) => adapter.graduate(await token.getAddress(), base, { value: 2, nonce }), "NativeAmountMismatch");
