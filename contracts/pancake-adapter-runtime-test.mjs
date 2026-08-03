@@ -1,39 +1,34 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createServer } from "node:net";
 import { readFileSync } from "node:fs";
 import solc from "solc";
 import { Contract, ContractFactory, JsonRpcProvider, Wallet, getCreateAddress } from "ethers";
 
 const dir = new URL(".", import.meta.url);
 const anvil = "/home/team/shared/tools/anvil/anvil";
+// This harness owns a separate, deterministic RPC. The workflow's shared Anvil
+// stays on 8545 for the other harnesses; using a fixed port avoids the
+// unused-port TOCTOU race and makes disappearance diagnosable.
+const ANVIL_PORT = Number(process.env.PANCAKE_ANVIL_PORT ?? 18545);
 let anvilProcess;
 let activeProvider;
 const anvilOutput = [];
-
-async function unusedPort() {
-  const server = createServer();
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const { port } = server.address();
-  await new Promise((resolve) => server.close(resolve));
-  return port;
-}
+let anvilExited = false;
 
 async function waitForRpc(provider) {
   console.log("[stage] wait for owned Anvil RPC");
   for (let attempt = 0; attempt < 30; attempt += 1) {
     try {
-      await provider.getBlockNumber();
+      const chainId = await provider.send("eth_chainId", []);
+      const block = await provider.getBlockNumber();
+      console.log(`[stage] owned Anvil ready chainId=${chainId} block=${block}`);
       return;
     } catch {
       await sleep(100);
     }
   }
-  throw new Error("Anvil did not become ready");
+  throw new Error(`Anvil did not become ready on port ${ANVIL_PORT}; output=${anvilOutput.join("").slice(-2000)}`);
 }
 
 const source = (file) => readFileSync(new URL(file, dir), "utf8");
@@ -95,7 +90,9 @@ async function waitForReceipt(provider, hash, label) {
     provider.send("eth_getTransactionReceipt", [hash]),
     provider.send("eth_blockNumber", []),
   ]);
-  console.error(`[diagnostic] ${label} hash=${hash} block=${blockNumber} tx=${JSON.stringify(transaction)} receipt=${JSON.stringify(receipt)} anvil=${anvilOutput.join("").slice(-4000)}`);
+  let chainId = "unavailable";
+  try { chainId = await provider.send("eth_chainId", []); } catch (error) { chainId = `error:${error.message}`; }
+  console.error(`[diagnostic] ${label} hash=${hash} block=${blockNumber} chainId=${chainId} tx=${JSON.stringify(transaction)} receipt=${JSON.stringify(receipt)} anvilExited=${anvilExited} anvil=${anvilOutput.join("").slice(-4000)}`);
   throw new Error(`${label} timed out after ${TX_TIMEOUT_MS}ms`);
 }
 async function deploy(artifact, signer, ...args) {
@@ -178,15 +175,17 @@ async function expectRevert(action, text) {
 async function main() {
   console.log("[stage] start adapter runtime harness");
   const A = compile();
-  console.log("[stage] select isolated ephemeral RPC port");
-  const port = await unusedPort();
-  anvilProcess = spawn(anvil, ["--host", "127.0.0.1", "--port", String(port), "--chain-id", "31337", "--accounts", "2", "--balance", "1000", "--threads", "1", "--silent"], { stdio: ["ignore", "pipe", "pipe"] });
+  console.log(`[stage] start owned RPC on port ${ANVIL_PORT}`);
+  anvilProcess = spawn(anvil, ["--host", "127.0.0.1", "--port", String(ANVIL_PORT), "--chain-id", "31337", "--accounts", "2", "--balance", "1000", "--threads", "1", "--silent"], { stdio: ["ignore", "pipe", "pipe"] });
   anvilProcess.stdout.on("data", (chunk) => anvilOutput.push(String(chunk)));
   anvilProcess.stderr.on("data", (chunk) => anvilOutput.push(String(chunk)));
   anvilProcess.once("error", (error) => console.error(`[stage] Anvil spawn error: ${error.message}`));
-  anvilProcess.once("exit", (code, signal) => { if (code !== 0 && signal !== "SIGTERM") console.error(`[stage] owned Anvil exited code=${code} signal=${signal}`); });
+  anvilProcess.once("exit", (code, signal) => {
+    anvilExited = true;
+    console.error(`[stage] owned Anvil exited code=${code} signal=${signal}`);
+  });
   await sleep(500);
-  const provider = new JsonRpcProvider(`http://127.0.0.1:${port}`, 31337, { staticNetwork: true, batchMaxCount: 1 });
+  const provider = new JsonRpcProvider(`http://127.0.0.1:${ANVIL_PORT}`, 31337, { staticNetwork: true, batchMaxCount: 1 });
   activeProvider = provider;
   await waitForRpc(provider);
   // Use a plain Wallet: provider nonce state is authoritative after constructor

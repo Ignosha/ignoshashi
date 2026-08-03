@@ -103,8 +103,43 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # The self-contained Pancake harness owns 18545; the production and
+          # mock harnesses own 8545. Fail early rather than silently sharing RPC.
+          if curl --fail --silent --show-error \
+            -H 'content-type: application/json' \
+            --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
+            http://127.0.0.1:18545 >/tmp/pancake-port-conflict.json 2>&1; then
+            echo 'Pancake harness port 18545 is already serving; refusing shared ownership' >&2
+            cat /tmp/pancake-port-conflict.json >&2
+            exit 1
+          fi
           timeout --signal=TERM --kill-after=10s 180s \
-            node contracts/pancake-adapter-runtime-test.mjs 2>&1 | tee "$PANCAKE_ADAPTER_LOG"
+            env PANCAKE_ANVIL_PORT=18545 node contracts/pancake-adapter-runtime-test.mjs 2>&1 | tee "$PANCAKE_ADAPTER_LOG"
+
+      - name: Diagnose runtime processes and RPC
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          echo '--- process table ---'
+          ps -eo pid,ppid,stat,etime,args --forest | grep -E '(^ *PID|anvil|node contracts/)' || true
+          echo '--- owned/shared Anvil RPC ---'
+          for port in 8545 18545; do
+            echo "port=$port"
+            curl --max-time 3 --silent --show-error \
+              -H 'content-type: application/json' \
+              --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
+              "http://127.0.0.1:$port" || true
+            curl --max-time 3 --silent --show-error \
+              -H 'content-type: application/json' \
+              --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+              "http://127.0.0.1:$port" || true
+            echo
+          done
+          echo '--- Anvil log ---'
+          test ! -f "$ANVIL_LOG" || cat "$ANVIL_LOG"
+          echo '--- Pancake harness log ---'
+          test ! -f "$PANCAKE_ADAPTER_LOG" || tail -200 "$PANCAKE_ADAPTER_LOG"
 
       - name: Upload runtime logs and artifacts
         if: always()
@@ -135,3 +170,4 @@ jobs:
             kill -KILL "$(cat "$ANVIL_PID")" 2>/dev/null || true
           fi
           test ! -f "$ANVIL_LOG" || cat "$ANVIL_LOG"
+/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
