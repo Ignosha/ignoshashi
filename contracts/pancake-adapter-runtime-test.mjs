@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import solc from "solc";
-import { Contract, ContractFactory, JsonRpcProvider, Wallet, getCreateAddress } from "ethers";
+import { Contract, ContractFactory, JsonRpcProvider, Wallet, getCreateAddress, id } from "ethers";
 
 const dir = new URL(".", import.meta.url);
 const anvil = "/home/team/shared/tools/anvil/anvil";
@@ -185,6 +185,22 @@ async function expectConstructorRevert(action, text) {
     assert.match(details, new RegExp(text));
   }
 }
+let customErrorSelectors = new Map();
+function findRevertData(error) {
+  const seen = new Set();
+  const visit = (value) => {
+    if (value == null || typeof value === "function") return undefined;
+    if (typeof value === "string") return value.match(/0x[0-9a-fA-F]{8,}/)?.[0];
+    if (typeof value !== "object" || seen.has(value)) return undefined;
+    seen.add(value);
+    for (const key of ["data", "error", "info", "cause", "value", "response"]) {
+      const found = visit(value[key]);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  return visit(error);
+}
 async function expectRevert(action, text) {
   let nonce;
   let submitted = false;
@@ -206,6 +222,9 @@ async function expectRevert(action, text) {
   } catch (error) {
     if (String(error.message).startsWith("expected ")) throw error;
     const details = String(error.shortMessage ?? error.message);
+    const expectedSelector = customErrorSelectors.get(text);
+    const revertData = findRevertData(error);
+    if (expectedSelector && revertData?.slice(0, 10).toLowerCase() === expectedSelector) return;
     // An estimation-only revert never submits a transaction. Rewind for every
     // such error, not only errors whose text happens to include "execution reverted".
     // This keeps the next ordinary transaction on the reserved nonce.
@@ -216,6 +235,9 @@ async function expectRevert(action, text) {
 async function main() {
   console.log("[stage] start adapter runtime harness");
   const A = compile();
+  customErrorSelectors = new Map(A.adapter.abi.filter((item) => item.type === "error").map((item) => [item.name, id(`${item.name}(${item.inputs.map((input) => input.type).join(",")})`).slice(0, 10).toLowerCase()]));
+  assert.ok(customErrorSelectors.has("WrongTimelock"), "adapter ABI must expose WrongTimelock");
+  console.log(`[stage] loaded ${customErrorSelectors.size} adapter custom-error selectors`);
   console.log(`[stage] start owned RPC on port ${ANVIL_PORT}`);
   // Keep Anvil's stdio detached from the harness. A piped child stream can
   // outlive/close independently on hosted runners and makes the RPC owner
