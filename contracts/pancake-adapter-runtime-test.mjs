@@ -128,6 +128,9 @@ async function main() {
     async () => deploy(A.adapter, signer, await factory.getAddress(), await mismatchedRouter.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress()),
     "INVALID_CONFIGURATION",
   );
+  // ContractFactory/NonceManager reserves a nonce before constructor estimation; an
+  // estimate-only revert leaves that local reservation unused and stalls the next tx.
+  signer.reset();
   const adapter = await deploy(A.adapter, signer, await factory.getAddress(), await router.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
   const token = await deploy(A.token, signer, "TOKEN");
   await waitTx(registry.set(signerAddress, await token.getAddress(), true), "registry.set");
