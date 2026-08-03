@@ -207,4 +207,3 @@ main().catch((error) => {
 }).finally(() => {
   if (anvilProcess) anvilProcess.kill("SIGTERM");
 });
-/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
