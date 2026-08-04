@@ -80,6 +80,3 @@ contract MockRegistry {
     function set(address curve, address token, bool value) external { auth[curve][token] = value; }
     function isAuthorizedGraduationCurve(address curve, address token) external view returns (bool) { return auth[curve][token]; }
 }
-/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
-/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
-/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
