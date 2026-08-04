@@ -205,11 +205,31 @@ function findRevertData(error) {
   visit(error);
   return found;
 }
-async function expectRevert(action, text) {
+async function assertRawRpcRevert(tx, expectedSelector, label) {
+  let rawError;
+  try {
+    await activeProvider.send("eth_estimateGas", [tx]);
+  } catch (error) {
+    rawError = error;
+  }
+  assert.ok(rawError, `${label} eth_estimateGas must revert`);
+  // Keep the provider's un-normalized payload in the failure output. ethers'
+  // Contract estimateGas wrapper may reduce this to "unknown custom error".
+  const payload = JSON.stringify(rawError, (_, value) => typeof value === "bigint" ? value.toString() : value);
+  const selectors = findRevertData(rawError);
+  console.log(`[rpc] ${label} eth_estimateGas raw=${payload}`);
+  assert.ok(selectors.includes(expectedSelector), `${label} raw revert selector ${expectedSelector} missing; selectors=${selectors.join(",")} payload=${payload}`);
+}
+async function expectRevert(action, text, options = {}) {
   let nonce;
+  let rawVerified = false;
   let submitted = false;
   try {
     nonce = await nextTransactionNonce(activeProvider, sharedSignerAddress);
+    if (options.rawRpc) {
+      await assertRawRpcRevert(options.rawRpc, options.rawSelector ?? customErrorSelectors.get(text), `expected ${text}`);
+      rawVerified = true;
+    }
     const result = await action(nonce);
     // Some revert paths are only detected when the submitted transaction is mined;
     // always drain that receipt so later helpers cannot leave a nonce gap.
@@ -233,6 +253,10 @@ async function expectRevert(action, text) {
     // This keeps the next ordinary transaction on the reserved nonce.
     if (!submitted) transactionNonce = nonce;
     if (expectedSelector && revertData.includes(expectedSelector)) return;
+    // Some RPC clients preserve the revert in eth_estimateGas but ethers'
+    // contract wrapper discards it before throwing. The raw assertion above is
+    // authoritative in that case; never accept generic text without it.
+    if (rawVerified && options.allowNormalizedUnknown) return;
     assert.match(details, new RegExp(text));
   }
 }
@@ -325,7 +349,16 @@ async function main() {
   const adapter4 = await deploy(A.adapter, signer, await factory3.getAddress(), await router4.getAddress(), await wbnb.getAddress(), timelock.address, await registry.getAddress());
   await waitTx(async (nonce) => router4.setActualToken(99, true, { nonce }), "router4.setActualToken");
   await waitTx(async (nonce) => token.approve(await adapter4.getAddress(), 100, { nonce }), "token.approve adapter4");
-  await expectRevert(async (nonce) => adapter4.graduate(await token.getAddress(), base, { value: 1, nonce }), "Slippage");
+  const adapter4GraduateData = adapter4.interface.encodeFunctionData("graduate", [await token.getAddress(), base]);
+  await expectRevert(
+    async (nonce) => adapter4.graduate(await token.getAddress(), base, { value: 1, nonce }),
+    "Slippage",
+    {
+      rawRpc: { from: signerAddress, to: await adapter4.getAddress(), data: adapter4GraduateData, value: "0x1" },
+      rawSelector: customErrorSelectors.get("Slippage"),
+      allowNormalizedUnknown: true,
+    },
+  );
 
   console.log("[stage] assertions complete");
   console.log("PASS adapter runtime: constructor configuration, authorization, timelock/amount/parameter checks, pair validation, zero liquidity, LP custody, allowance reset, replay, and slippage rollback");
