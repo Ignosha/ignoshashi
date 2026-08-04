@@ -41,5 +41,3 @@ funds/permissions associated with each exposed wallet; and store the replacement
 the protected runtime secret manager under the variable names above. Do not reuse the
 prior key material. Verify each replacement wallet address against the intended public
 pool address before any test deployment.
-/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
-/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
