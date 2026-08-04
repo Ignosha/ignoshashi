@@ -20,6 +20,7 @@ import { deployToken, type DeployStep, type DeployProgress } from "~/services/to
 import { getBondingCurveFactoryAddress } from "~/contracts/addresses";
 import { BNB_TESTNET_CHAIN_ID, BNB_TESTNET, switchToBnbTestnet } from "~/config/networks";
 import { getBnbTestnetFactoryAddress } from "~/services/bnbTestnetTokenCreation";
+import { useMetaMaskBnb } from "~/services/metamaskBnb";
 
 export const Route = createFileRoute("/create")({
   component: CreatePage,
@@ -27,6 +28,7 @@ export const Route = createFileRoute("/create")({
 
 function CreatePage() {
   const { connected, connect, solAddress, ethAddress, getAddressForChain } = useWallet();
+  const bnbWallet = useMetaMaskBnb();
   const { triggerToast } = useAchievements();
   const usdPrices = useUsdPrice();
   const [name, setName] = useState("");
@@ -544,11 +546,20 @@ function CreatePage() {
             {blockchain === "bnbTestnet" && (
               <div className="retro-card bg-[#21180d] p-3 text-center">
                 <p className="text-xs text-[#ffd23f]" style={{ fontFamily: '"VT323", monospace', fontSize: "1rem" }}>
-                  ⏸ BNB TESTNET NOT READY — TESTNET ONLY (CHAIN ID 97). No deployment or fees are live.
+                  🧪 BNB TESTNET QA — CREATION ONLY. Trading, fees, and graduation are disabled.
                 </p>
-                <button type="button" onClick={() => switchToBnbTestnet((window as any).ethereum)} className="retro-btn mt-2" disabled={bnbFactoryConfigured}>
-                  SWITCH WALLET TO BNB TESTNET
-                </button>
+                {!bnbWallet.address ? (
+                  <button type="button" onClick={() => void bnbWallet.connect()} className="retro-btn retro-btn-yellow mt-3" style={{ fontFamily: '"Press Start 2P", monospace' }}>
+                    🦊 CONNECT METAMASK
+                  </button>
+                ) : (
+                  <div className="mt-3 space-y-2">
+                    <p className="text-[#00ff41]" style={{ fontFamily: '"VT323", monospace', fontSize: "1.1rem" }}>CONNECTED: {bnbWallet.shortAddress}</p>
+                    {!bnbWallet.isBnbTestnet && <button type="button" onClick={() => void bnbWallet.connect()} className="retro-btn retro-btn-outline" style={{ fontFamily: '"Press Start 2P", monospace' }}>SWITCH TO BNB TESTNET</button>}
+                    <p className="text-[#b0d0b0]" style={{ fontFamily: '"VT323", monospace', fontSize: "0.9rem" }}>Verified factory: {bnbWallet.factoryAddress}</p>
+                  </div>
+                )}
+                {bnbWallet.error && <p className="text-[#ef476f] mt-2" role="alert" style={{ fontFamily: '"VT323", monospace', fontSize: "0.95rem" }}>{bnbWallet.error}</p>}
               </div>
             )}
             {/* Launch button */}
