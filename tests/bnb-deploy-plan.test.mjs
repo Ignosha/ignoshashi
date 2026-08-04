@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const script = readFileSync(new URL('../scripts/bnb-testnet-deploy-plan.mjs', import.meta.url), 'utf8');
+assert.match(script, /CHAIN_ID = 97/);
+assert.match(script, /estimateGas/);
+assert.match(script, /PLAN_ONLY_NOT_BROADCAST/);
+assert.doesNotMatch(script, /privateKey|sendTransaction|\.broadcast\(/i);
+assert.match(script, /lpTimelock.*graduationRegistry.*pancakeV2Adapter.*productionTokenFactory/s);
+assert.match(script, /BNB_CHAIN_ID !== '97'/);
+assert.match(script, /56/);
+console.log('BNB deployment plan tests passed: ordering, chain gating, no signer/broadcast');
