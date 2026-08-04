@@ -360,7 +360,9 @@ async function main() {
   // reports its deliberately short actual amount; otherwise ExactAmountMismatch
   // (0x596b23a7) correctly wins before the post-router Slippage guard.
   await waitTx(async (nonce) => router4.setTransferFullToken(true, { nonce }), "router4.setTransferFullToken");
-  await waitTx(async (nonce) => router4.setActualToken(99, true, { nonce }), "router4.setActualToken");
+  // The minimum is 99; return 98 so the adapter's post-router guard must
+  // revert Slippage while the router still pulls the full 100-token transfer.
+  await waitTx(async (nonce) => router4.setActualToken(98, true, { nonce }), "router4.setActualToken");
   await waitTx(async (nonce) => token.approve(await adapter4.getAddress(), 100, { nonce }), "token.approve adapter4");
   const adapter4GraduateData = adapter4.interface.encodeFunctionData("graduate", [await token.getAddress(), base]);
   await expectRevert(
