@@ -53,18 +53,21 @@ contract MockRouter {
     bool public useActualToken;
     bool public useActualNative;
     bool public retainToken;
+    bool public transferFullToken;
 
     constructor(address f, address w) { factory = f; WETH = w; }
     function setActualToken(uint256 amount, bool enabled) external { actualToken = amount; useActualToken = enabled; }
     function setActualNative(uint256 amount, bool enabled) external { actualNative = amount; useActualNative = enabled; }
     function setLiquidity(uint256 amount) external { liquidity = amount; }
     function setRetainToken(bool enabled) external { retainToken = enabled; }
+    function setTransferFullToken(bool enabled) external { transferFullToken = enabled; }
     function addLiquidityETH(
         address token, uint256 amount, uint256, uint256, address to, uint256
     ) external payable returns (uint256, uint256, uint256) {
         uint256 usedToken = useActualToken ? actualToken : amount;
         uint256 usedNative = useActualNative ? actualNative : msg.value;
-        if (!retainToken) require(MockERC20(token).transferFrom(msg.sender, address(this), usedToken), "token transfer");
+        uint256 transferToken = transferFullToken ? amount : usedToken;
+        if (!retainToken) require(MockERC20(token).transferFrom(msg.sender, address(this), transferToken), "token transfer");
         address p = MockFactory(factory).getPair(token, WETH);
         if (p == address(0)) p = MockFactory(factory).createPair(token, WETH);
         MockPair(p).mint(to, liquidity);
@@ -77,3 +80,6 @@ contract MockRegistry {
     function set(address curve, address token, bool value) external { auth[curve][token] = value; }
     function isAuthorizedGraduationCurve(address curve, address token) external view returns (bool) { return auth[curve][token]; }
 }
+/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
+/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
+/home/agent-lead/.profile: line 29: /home/agent-lead/.cargo/env: No such file or directory
