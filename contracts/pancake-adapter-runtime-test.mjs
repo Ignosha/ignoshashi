@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import solc from "solc";
-import { Contract, ContractFactory, JsonRpcProvider, Wallet, getCreateAddress, id } from "ethers";
+import { Contract, ContractFactory, Interface, JsonRpcProvider, Wallet, getCreateAddress } from "ethers";
 
 const dir = new URL(".", import.meta.url);
 const anvil = "/home/team/shared/tools/anvil/anvil";
@@ -263,9 +263,17 @@ async function expectRevert(action, text, options = {}) {
 async function main() {
   console.log("[stage] start adapter runtime harness");
   const A = compile();
-  customErrorSelectors = new Map(A.adapter.abi.filter((item) => item.type === "error").map((item) => [item.name, id(`${item.name}(${item.inputs.map((input) => input.type).join(",")})`).slice(0, 10).toLowerCase()]));
+  const adapterInterface = new Interface(A.adapter.abi);
+  const adapterErrors = A.adapter.abi.filter((item) => item.type === "error").map((item) => {
+    const fragment = adapterInterface.getError(item.name);
+    assert.ok(fragment, `adapter ABI error fragment missing for ${item.name}`);
+    const signature = fragment.format("sighash");
+    const selector = fragment.selector.toLowerCase();
+    return { name: item.name, signature, selector };
+  });
+  customErrorSelectors = new Map(adapterErrors.map(({ name, selector }) => [name, selector]));
   assert.ok(customErrorSelectors.has("WrongTimelock"), "adapter ABI must expose WrongTimelock");
-  console.log(`[stage] loaded ${customErrorSelectors.size} adapter custom-error selectors`);
+  console.log(`[stage] adapter custom-error selectors=${JSON.stringify(adapterErrors)}`);
   console.log(`[stage] start owned RPC on port ${ANVIL_PORT}`);
   // Keep Anvil's stdio detached from the harness. A piped child stream can
   // outlive/close independently on hosted runners and makes the RPC owner
